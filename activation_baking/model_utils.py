@@ -53,7 +53,11 @@ def load_model_and_tokenizer(
     )
     model.eval()
 
-    tokenizer = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        hf_id,
+        trust_remote_code=True,
+        clean_up_tokenization_spaces=False,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
