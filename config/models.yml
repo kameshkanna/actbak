@@ -7,7 +7,7 @@ models:
     dtype: bfloat16
 
   - name: qwen3-8b-instruct
-    hf_id: Qwen/Qwen3-8B-Instruct
+    hf_id: Qwen/Qwen3-8B
     norm_type: pre
     hidden_size: 4096
     num_layers: 36
