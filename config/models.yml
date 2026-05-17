@@ -6,14 +6,12 @@ models:
     num_layers: 32
     dtype: bfloat16
 
-  - name: qwen3-8b-instruct
-    hf_id: Qwen/Qwen3-8B
+  - name: qwen2.5-7b-instruct
+    hf_id: Qwen/Qwen2.5-7B-Instruct
     norm_type: pre
-    hidden_size: 4096
-    num_layers: 36
+    hidden_size: 3584
+    num_layers: 28
     dtype: bfloat16
-    extra:
-      enable_thinking: false
 
   - name: gemma-2-9b-it
     hf_id: google/gemma-2-9b-it
