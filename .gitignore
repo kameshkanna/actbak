@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.DS_Store
+results/*.csv
+results/*.json
+figures/*.pdf
+figures/*.png
+*.safetensors
+*.bin
+.env
