@@ -337,7 +337,7 @@ class SmallModelJudge:
         judge.unload()
     """
 
-    DEFAULT_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+    DEFAULT_MODEL = "Qwen/Qwen2.5-3B-Instruct"
 
     def __init__(
         self,

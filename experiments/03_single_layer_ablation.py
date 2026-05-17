@@ -298,7 +298,7 @@ def parse_args() -> argparse.Namespace:
                         default=["k_sweep", "depth", "schedule"],
                         choices=["k_sweep", "depth", "schedule"])
     parser.add_argument("--judge-model", default=SmallModelJudge.DEFAULT_MODEL)
-    parser.add_argument("--judge-batch-size", type=int, default=16)
+    parser.add_argument("--judge-batch-size", type=int, default=8)
     return parser.parse_args()
 
 
