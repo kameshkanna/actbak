@@ -15,6 +15,8 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 logger = logging.getLogger(__name__)
 
+_UNSET = object()  # sentinel for optional completion_start
+
 
 @dataclass
 class BehavioralDirection:
@@ -56,6 +58,7 @@ class DirectionExtractor:
         self._device = next(model.parameters()).device
         self._hooks: list = []
         self._activations: dict[int, list[np.ndarray]] = {}
+        self._completion_start: int = 0  # tokens before completion; 0 = full sequence
 
     @property
     def middle_layers(self) -> list[int]:
@@ -66,8 +69,10 @@ class DirectionExtractor:
     def _make_hook(self, layer_idx: int) -> Callable:
         def hook(module: nn.Module, input: tuple, output: tuple | torch.Tensor) -> None:
             hidden: torch.Tensor = output[0] if isinstance(output, tuple) else output
-            # mean-pool over sequence → (hidden_size,)
-            vec = hidden.detach().float().mean(dim=1).squeeze(0).cpu().numpy()
+            start = self._completion_start
+            # pool over completion tokens only when a context boundary is set
+            segment = hidden[:, start:, :] if start > 0 and start < hidden.shape[1] else hidden
+            vec = segment.detach().float().mean(dim=1).squeeze(0).cpu().numpy()
             self._activations[layer_idx].append(vec)
         return hook
 
@@ -84,14 +89,25 @@ class DirectionExtractor:
             h.remove()
         self._hooks.clear()
 
-    def _collect_activations(self, prompts: list[str]) -> dict[int, np.ndarray]:
-        """Run prompts through model, return per-layer activation matrix (n, d)."""
+    def _collect_activations(
+        self,
+        prompts: list[str],
+        context_lens: list[int] | None = None,
+    ) -> dict[int, np.ndarray]:
+        """Run prompts through model, return per-layer activation matrix (n, d).
+
+        Args:
+            prompts: Full tokenizable strings (context + completion).
+            context_lens: If provided, pool activations over completion tokens only.
+                          Each entry is the number of context tokens for that prompt.
+        """
         for idx in self.middle_layers:
             self._activations[idx] = []
 
         self._register_hooks()
         try:
-            for prompt in tqdm(prompts, desc="  collecting", dynamic_ncols=True, leave=False):
+            for i, prompt in enumerate(tqdm(prompts, desc="  collecting", dynamic_ncols=True, leave=False)):
+                self._completion_start = context_lens[i] if context_lens is not None else 0
                 inputs = self._tokenizer(
                     prompt,
                     return_tensors="pt",
@@ -105,6 +121,7 @@ class DirectionExtractor:
                     torch.cuda.empty_cache()
         finally:
             self._remove_hooks()
+            self._completion_start = 0
 
         return {idx: np.stack(self._activations[idx]) for idx in self.middle_layers}
 
@@ -113,13 +130,18 @@ class DirectionExtractor:
         pos_prompts: list[str],
         neg_prompts: list[str],
         n_pca_components: int = 5,
+        contexts: list[str] | None = None,
     ) -> list[BehavioralDirection]:
         """Extract behavioral directions from contrastive prompt pairs.
 
         Args:
-            pos_prompts: Prompts strongly eliciting the target behavior.
-            neg_prompts: Prompts strongly suppressing the target behavior.
+            pos_prompts: Full strings (context + positive completion).
+            neg_prompts: Full strings (context + negative completion).
             n_pca_components: Number of PCA components to fit (PC1 is used).
+            contexts: Raw context strings shared by both poles. When provided,
+                      activations are pooled over completion tokens only, giving
+                      a sharper directional estimate uncontaminated by the
+                      identical context prefix.
 
         Returns:
             One BehavioralDirection per middle layer, sorted by layer index.
@@ -127,11 +149,24 @@ class DirectionExtractor:
         assert len(pos_prompts) == len(neg_prompts), \
             "Positive and negative prompt counts must match."
 
+        context_lens: list[int] | None = None
+        if contexts is not None:
+            assert len(contexts) == len(pos_prompts), \
+                "contexts length must match number of pairs."
+            context_lens = [
+                len(self._tokenizer(ctx, add_special_tokens=True)["input_ids"])
+                for ctx in contexts
+            ]
+            logger.info(
+                "Completion-only pooling enabled. Mean context len: %.1f tokens",
+                sum(context_lens) / len(context_lens),
+            )
+
         logger.info("Collecting positive activations (%d prompts)...", len(pos_prompts))
-        pos_acts = self._collect_activations(pos_prompts)
+        pos_acts = self._collect_activations(pos_prompts, context_lens)
 
         logger.info("Collecting negative activations (%d prompts)...", len(neg_prompts))
-        neg_acts = self._collect_activations(neg_prompts)
+        neg_acts = self._collect_activations(neg_prompts, context_lens)
 
         directions: list[BehavioralDirection] = []
         for layer_idx in self.middle_layers:

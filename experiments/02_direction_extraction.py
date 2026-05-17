@@ -34,7 +34,7 @@ from activation_baking.direction_extractor import (
     DirectionExtractor,
     save_directions,
 )
-from activation_baking.model_utils import format_prompt, load_model_and_tokenizer
+from activation_baking.model_utils import load_model_and_tokenizer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,15 +44,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def load_pairs(path: Path) -> tuple[list[str], list[str]]:
-    """Load contrastive pairs JSONL, return (positive_prompts, negative_prompts)."""
-    positives, negatives = [], []
+def load_pairs(path: Path) -> tuple[list[str], list[str], list[str]]:
+    """Load completion-based contrastive pairs JSONL.
+
+    Returns:
+        (positive_full_prompts, negative_full_prompts, contexts) where each
+        full prompt is context + completion. All strings carry embedded role
+        labels and are tokenised directly (no chat template applied).
+    """
+    positives, negatives, contexts = [], [], []
     with path.open(encoding="utf-8") as f:
         for line in f:
             obj = json.loads(line)
-            positives.append(obj["positive"])
-            negatives.append(obj["negative"])
-    return positives, negatives
+            ctx = obj["context"]
+            positives.append(ctx + obj["positive_completion"])
+            negatives.append(ctx + obj["negative_completion"])
+            contexts.append(ctx)
+    return positives, negatives, contexts
 
 
 def load_k_values(norm_profile_path: Path, num_layers: int) -> dict[int, float]:
@@ -76,7 +84,7 @@ def run_extraction(
     model_name = model_cfg["name"]
     logger.info("--- %s | %s ---", model_name, behavior)
 
-    positives, negatives = load_pairs(pairs_path)
+    positives, negatives, contexts = load_pairs(pairs_path)
     logger.info("Loaded %d contrastive pairs", len(positives))
 
     k_values = load_k_values(norm_profile_path, model_cfg["num_layers"])
@@ -87,9 +95,6 @@ def run_extraction(
         load_in_4bit=load_in_4bit,
     )
 
-    pos_prompts = [format_prompt(tokenizer, p, extra_cfg) for p in positives]
-    neg_prompts = [format_prompt(tokenizer, p, extra_cfg) for p in negatives]
-
     extractor = DirectionExtractor(
         model=model,
         tokenizer=tokenizer,
@@ -98,7 +103,9 @@ def run_extraction(
         k_values=k_values,
     )
 
-    directions = extractor.extract(pos_prompts, neg_prompts)
+    # Contrastive pairs carry embedded role labels; pass raw strings directly.
+    # contexts enables completion-only pooling for a sharper directional signal.
+    directions = extractor.extract(positives, negatives, contexts=contexts)
 
     out_dir = output_dir / model_name
     out_dir.mkdir(parents=True, exist_ok=True)
