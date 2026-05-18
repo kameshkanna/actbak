@@ -51,7 +51,7 @@ import yaml
 from tqdm import tqdm
 
 from activation_baking.direction_extractor import load_directions
-from activation_baking.judges import ActivationJudge
+from activation_baking.judges import ActivationJudge, SmallModelJudge
 from activation_baking.model_utils import format_prompt, load_model_and_tokenizer
 from activation_baking.steerer import ActivationSteerer
 
@@ -239,50 +239,110 @@ def _savefig(fig: plt.Figure, path: Path) -> None:
     logger.info("Saved → %s", path)
 
 
+def _dynamic_ylim(ax: plt.Axes, vals: pd.Series, lo: float = -1.0, hi: float = 1.0) -> None:
+    margin = max(0.02, (vals.max() - vals.min()) * 0.3)
+    ax.set_ylim(max(lo, vals.min() - margin), min(hi, vals.max() + margin))
+
+
+def _add_llm_axis(ax: plt.Axes, x_vals: pd.Series, llm_vals: pd.Series,
+                  x_is_categorical: bool = False) -> plt.Axes:
+    """Overlay LLM score on a twin y-axis (right side, orange dashed)."""
+    ax2 = ax.twinx()
+    if x_is_categorical:
+        ax2.plot(range(len(x_vals)), llm_vals.values, marker="s", lw=1.5,
+                 ls="--", color="#f97316", alpha=0.8, label="LLM score")
+    else:
+        ax2.plot(x_vals, llm_vals, marker="s", lw=1.5,
+                 ls="--", color="#f97316", alpha=0.8, label="LLM score")
+    ax2.set_ylabel("LLM judge score (0–1)", color="#f97316")
+    ax2.tick_params(axis="y", labelcolor="#f97316")
+    _dynamic_ylim(ax2, llm_vals, 0.0, 1.0)
+    return ax2
+
+
 def plot_k_sweep(df: pd.DataFrame, behavior: str, model_name: str, fig_dir: Path) -> None:
-    agg = df.groupby("k_scale")["judge_score"].mean().reset_index()
+    has_llm = "llm_score" in df.columns and df["llm_score"].notna().any()
+    agg_cols = ["cosine_sim"] + (["llm_score"] if has_llm else [])
+    agg = df.groupby("k_scale")[agg_cols].mean().reset_index()
+
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(agg["k_scale"], agg["judge_score"], marker="o", lw=2, color="#2563eb")
-    ax.axvline(x=1.0, color="#dc2626", ls="--", lw=1.2, label="K = K_ℓ (formula)")
+    ax.plot(agg["k_scale"], agg["cosine_sim"], marker="o", lw=2,
+            color="#2563eb", label="Cosine sim (activation)")
+    ax.axvline(x=1.0, color="#dc2626", ls="--", lw=1.2, label="K = K_ℓ")
     ax.set_xlabel("K scale (× formula K_ℓ)")
-    ax.set_ylabel("Cosine sim to behavioral direction")
+    ax.set_ylabel("Cosine sim to behavioral direction", color="#2563eb")
+    ax.tick_params(axis="y", labelcolor="#2563eb")
     ax.set_title(f"{model_name} | {behavior} — K sweep")
-    y_vals = agg["judge_score"]
-    margin = max(0.05, (y_vals.max() - y_vals.min()) * 0.3)
-    ax.set_ylim(max(-1.0, y_vals.min() - margin), min(1.0, y_vals.max() + margin))
-    ax.legend()
+    _dynamic_ylim(ax, agg["cosine_sim"])
+
+    lines, labels = ax.get_legend_handles_labels()
+    if has_llm:
+        ax2 = _add_llm_axis(ax, agg["k_scale"], agg["llm_score"])
+        l2, lb2 = ax2.get_legend_handles_labels()
+        lines += l2; labels += lb2
+
+    ax.legend(lines, labels, loc="upper left", fontsize=8)
     ax.grid(True, alpha=0.3)
     _savefig(fig, fig_dir / "k_sweep.pdf")
 
 
 def plot_depth_ablation(df: pd.DataFrame, behavior: str, model_name: str, fig_dir: Path) -> None:
-    agg = df.groupby("inject_layer")["judge_score"].mean().reset_index()
+    has_llm = "llm_score" in df.columns and df["llm_score"].notna().any()
+    agg_cols = ["cosine_sim"] + (["llm_score"] if has_llm else [])
+    agg = df.groupby("inject_layer")[agg_cols].mean().reset_index()
     target_layer = int(df["target_layer"].iloc[0])
+
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(agg["inject_layer"], agg["judge_score"], marker="o", lw=2, color="#16a34a")
+    ax.plot(agg["inject_layer"], agg["cosine_sim"], marker="o", lw=2,
+            color="#16a34a", label="Cosine sim (activation)")
     ax.axvline(x=target_layer, color="#dc2626", ls="--", lw=1.2, label="Target layer l*")
     ax.set_xlabel("Injection layer")
-    ax.set_ylabel("Cosine sim to behavioral direction")
+    ax.set_ylabel("Cosine sim to behavioral direction", color="#16a34a")
+    ax.tick_params(axis="y", labelcolor="#16a34a")
     ax.set_title(f"{model_name} | {behavior} — injection depth")
-    y_vals = agg["judge_score"]
-    margin = max(0.05, (y_vals.max() - y_vals.min()) * 0.3)
-    ax.set_ylim(max(-1.0, y_vals.min() - margin), min(1.0, y_vals.max() + margin))
-    ax.legend()
+    _dynamic_ylim(ax, agg["cosine_sim"])
+
+    lines, labels = ax.get_legend_handles_labels()
+    if has_llm:
+        ax2 = _add_llm_axis(ax, agg["inject_layer"], agg["llm_score"])
+        l2, lb2 = ax2.get_legend_handles_labels()
+        lines += l2; labels += lb2
+
+    ax.legend(lines, labels, loc="upper left", fontsize=8)
     ax.grid(True, alpha=0.3)
     _savefig(fig, fig_dir / "depth_ablation.pdf")
 
 
 def plot_schedule(df: pd.DataFrame, behavior: str, model_name: str, fig_dir: Path) -> None:
-    agg = df.groupby("schedule")["judge_score"].mean().reset_index()
-    colors = {"ramp": "#7c3aed", "flat": "#d97706"}
-    fig, ax = plt.subplots(figsize=(4, 4))
-    for _, row in agg.iterrows():
-        ax.bar(row["schedule"], row["judge_score"], color=colors.get(row["schedule"], "gray"))
-    ax.set_ylabel("Cosine sim to behavioral direction")
+    has_llm = "llm_score" in df.columns and df["llm_score"].notna().any()
+    agg_cols = ["cosine_sim"] + (["llm_score"] if has_llm else [])
+    agg = df.groupby("schedule")[agg_cols].mean().reset_index()
+    schedules = agg["schedule"].tolist()
+    x = np.arange(len(schedules))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(5, 4))
+    bars = ax.bar(x - (width / 2 if has_llm else 0), agg["cosine_sim"],
+                  width if has_llm else 0.5, color=["#7c3aed", "#2563eb"][:len(schedules)],
+                  label="Cosine sim (activation)")
+    ax.set_xticks(x); ax.set_xticklabels(schedules)
+    ax.set_ylabel("Cosine sim to behavioral direction", color="#2563eb")
+    ax.tick_params(axis="y", labelcolor="#2563eb")
     ax.set_title(f"{model_name} | {behavior} — ramp vs flat")
-    y_vals = agg["judge_score"]
-    margin = max(0.05, (y_vals.max() - y_vals.min()) * 0.3)
-    ax.set_ylim(max(-1.0, y_vals.min() - margin), min(1.0, y_vals.max() + margin))
+    _dynamic_ylim(ax, agg["cosine_sim"])
+
+    lines, labels = ax.get_legend_handles_labels()
+    if has_llm:
+        ax2 = ax.twinx()
+        ax2.bar(x + width / 2, agg["llm_score"], width,
+                color=["#f97316", "#fb923c"][:len(schedules)], alpha=0.7, label="LLM score")
+        ax2.set_ylabel("LLM judge score (0–1)", color="#f97316")
+        ax2.tick_params(axis="y", labelcolor="#f97316")
+        _dynamic_ylim(ax2, agg["llm_score"], 0.0, 1.0)
+        l2, lb2 = ax2.get_legend_handles_labels()
+        lines += l2; labels += lb2
+
+    ax.legend(lines, labels, fontsize=8)
     ax.grid(True, axis="y", alpha=0.3)
     _savefig(fig, fig_dir / "schedule_ablation.pdf")
 
@@ -306,7 +366,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ablations", nargs="*",
                         default=["k_sweep", "depth", "schedule"],
                         choices=["k_sweep", "depth", "schedule"])
+    parser.add_argument("--judge-model", default=SmallModelJudge.DEFAULT_MODEL,
+                        help="HuggingFace model ID for the LLM judge (run alongside ActivationJudge)")
     parser.add_argument("--judge-batch-size", type=int, default=8)
+    parser.add_argument("--skip-llm-judge", action="store_true",
+                        help="Run only ActivationJudge (skip SmallModelJudge)")
     return parser.parse_args()
 
 
@@ -383,22 +447,39 @@ def main() -> None:
     logger.info("Raw generations saved → %s/raw_generations.csv", out_dir)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # PHASE 2: Activation-space scoring (same model, no auxiliary judge)
+    # PHASE 2a: Activation-space scoring (ActivationJudge — same model, no aux)
     # ─────────────────────────────────────────────────────────────────────────
-    logger.info("=== Phase 2: Activation scoring %d records at layer %d ===",
+    logger.info("=== Phase 2a: Activation scoring %d records at layer %d ===",
                 len(all_records), target_layer)
     direction_map = {d.layer_idx: d.mean_direction for d in directions}
-    judge = ActivationJudge(
+    act_judge = ActivationJudge(
         model=model,
         tokenizer=tokenizer,
         direction_map=direction_map,
     )
-    scores = judge.score_records(
+    cosine_scores = act_judge.score_records(
         all_records, target_layer=target_layer, batch_size=args.judge_batch_size
     )
+    for rec, score in zip(all_records, cosine_scores):
+        rec["cosine_sim"] = score
+        rec["judge_score"] = score  # primary metric alias for downstream plotting
 
-    for rec, score in zip(all_records, scores):
-        rec["judge_score"] = score
+    # ─────────────────────────────────────────────────────────────────────────
+    # PHASE 2b: LLM judge scoring (SmallModelJudge — loaded after generation)
+    # ─────────────────────────────────────────────────────────────────────────
+    if not args.skip_llm_judge:
+        logger.info("=== Phase 2b: LLM judge scoring %d records (model: %s) ===",
+                    len(all_records), args.judge_model)
+        llm_judge = SmallModelJudge(model_id=args.judge_model)
+        llm_scores = llm_judge.score_records(all_records, batch_size=args.judge_batch_size)
+        llm_judge.unload()
+        for rec, score in zip(all_records, llm_scores):
+            rec["llm_score"] = score
+        logger.info("LLM judge complete.")
+    else:
+        logger.info("Phase 2b skipped (--skip-llm-judge).")
+        for rec in all_records:
+            rec["llm_score"] = float("nan")
 
     scored_df = pd.DataFrame(all_records)
     scored_df.to_csv(out_dir / "scored_results.csv", index=False)
