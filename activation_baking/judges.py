@@ -1,11 +1,13 @@
 """Behavior scoring for activation steering evaluations.
 
-Three scorers are provided:
+Four scorers are provided:
 
 - ``HeuristicScorer``: regex/keyword-based, zero-latency, for direction-sign checks.
 - ``PerplexityScorer``: token log-probability under a reference model (coherence proxy).
-- ``SmallModelJudge``: loads a small local LLM and scores responses in batches.
-  Designed to run after all generation is complete for maximum throughput.
+- ``ActivationJudge``: activation-space scorer — cosine similarity of hidden states to the
+  behavioral direction at the target layer. Uses the already-loaded main model; no auxiliary
+  model required. Eliminates LLM-judge collapse. Scores ∈ [-1, 1].
+- ``SmallModelJudge``: (legacy) loads a small local LLM and scores responses in batches.
 """
 
 import logging
@@ -16,6 +18,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
@@ -294,7 +297,157 @@ class JudgePromptBuilder:
 
 
 # ---------------------------------------------------------------------------
-# Small-model local judge
+# Activation-space judge (primary scorer — replaces LLM judge)
+# ---------------------------------------------------------------------------
+
+
+class ActivationJudge:
+    """Activation-space scorer mirroring the BehavioralEvaluator from AVAW/norms-k-calibration.
+
+    Measures cosine similarity between the last-token hidden state at ``target_layer``
+    and the pre-extracted behavioral direction vector.  Uses the already-loaded main model
+    for forward passes — no auxiliary model loaded, no risk of judge collapse.
+
+    Score ∈ [-1, 1]: higher = stronger alignment with the behavioral direction.
+
+    Example::
+
+        judge = ActivationJudge(model, tokenizer, {layer_idx: direction_np, ...})
+        scores = judge.score_records(records, target_layer=16, batch_size=8)
+    """
+
+    def __init__(
+        self,
+        model: PreTrainedModel,
+        tokenizer: PreTrainedTokenizerBase,
+        direction_map: dict[int, np.ndarray],
+        max_length: int = 512,
+    ) -> None:
+        """
+        Args:
+            model: Loaded main model (same one used for generation).
+            tokenizer: Corresponding tokenizer.
+            direction_map: ``{layer_idx: unit-norm direction of shape (hidden_size,)}``.
+            max_length: Token truncation limit for scored texts.
+        """
+        self._model = model
+        self._tokenizer = tokenizer
+        self._direction_map: dict[int, torch.Tensor] = {
+            layer_idx: torch.from_numpy(d.copy()).float()
+            for layer_idx, d in direction_map.items()
+        }
+        self._max_length = max_length
+        self._device = next(model.parameters()).device
+
+        # Ensure tokenizer has a padding token
+        if self._tokenizer.pad_token is None:
+            self._tokenizer.pad_token = self._tokenizer.eos_token
+        self._tokenizer.padding_side = "right"
+
+    @torch.no_grad()
+    def _extract_last_token_hidden(
+        self,
+        texts: list[str],
+        target_layer: int,
+    ) -> torch.Tensor:
+        """Extract last-real-token hidden state at target_layer for a batch of texts.
+
+        Args:
+            texts: Full strings (user_input + response).
+            target_layer: Index into model.model.layers.
+
+        Returns:
+            Float32 tensor of shape (batch, hidden_size) on CPU.
+        """
+        captured: list[torch.Tensor] = []
+
+        def _hook(module: Any, inp: Any, output: Any) -> None:
+            hidden = output[0] if isinstance(output, tuple) else output
+            captured.append(hidden.detach().float().cpu())
+
+        handle = self._model.model.layers[target_layer].register_forward_hook(_hook)
+        try:
+            enc = self._tokenizer(
+                texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self._max_length,
+            ).to(self._device)
+            self._model(**enc)
+        finally:
+            handle.remove()
+
+        hidden_batch: torch.Tensor = captured[0]   # [B, T, d]
+        lengths: torch.Tensor = enc["attention_mask"].sum(-1).cpu()  # [B]
+        last_hidden = torch.stack(
+            [hidden_batch[i, lengths[i] - 1, :] for i in range(len(texts))]
+        )  # [B, d]
+        return last_hidden
+
+    @torch.no_grad()
+    def score_records(
+        self,
+        records: list[dict[str, Any]],
+        target_layer: int,
+        batch_size: int = 8,
+    ) -> list[float]:
+        """Score records by cosine similarity of response activations to the behavioral direction.
+
+        Forward-passes ``user_input + response`` through the main model, extracts the
+        last-token hidden state at ``target_layer``, and returns cosine similarity
+        to ``direction_map[target_layer]``.
+
+        Args:
+            records: Each dict must have ``user_input`` and ``response``.
+            target_layer: Layer at which to measure activation alignment.
+            batch_size: Number of texts per forward pass.
+
+        Returns:
+            Cosine similarity scores ∈ [-1, 1], same order as ``records``.
+
+        Raises:
+            ValueError: If ``target_layer`` is not in ``direction_map``.
+        """
+        if target_layer not in self._direction_map:
+            raise ValueError(
+                f"target_layer {target_layer} not in direction_map. "
+                f"Available layers: {sorted(self._direction_map)}"
+            )
+
+        direction = F.normalize(
+            self._direction_map[target_layer].unsqueeze(0), p=2, dim=-1
+        ).squeeze(0)  # [d], unit-norm, cpu
+
+        texts = [f"{r['user_input']} {r['response']}" for r in records]
+        all_scores: list[float] = []
+
+        for i in tqdm(
+            range(0, len(texts), batch_size),
+            desc="activation scoring",
+            dynamic_ncols=True,
+        ):
+            batch = texts[i : i + batch_size]
+            hidden = self._extract_last_token_hidden(batch, target_layer)  # [B, d]
+            hidden_norm = F.normalize(hidden, p=2, dim=-1)              # [B, d]
+            sims = (hidden_norm @ direction).tolist()                   # [B]
+            all_scores.extend(sims)
+
+            if self._device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        logger.info(
+            "ActivationJudge scored %d records at layer %d | "
+            "mean=%.4f  std=%.4f  min=%.4f  max=%.4f",
+            len(all_scores), target_layer,
+            float(np.mean(all_scores)), float(np.std(all_scores)),
+            float(np.min(all_scores)), float(np.max(all_scores)),
+        )
+        return all_scores
+
+
+# ---------------------------------------------------------------------------
+# Small-model local judge (legacy — kept for reference)
 # ---------------------------------------------------------------------------
 
 _JUDGE_RUBRICS: dict[str, str] = {

@@ -12,10 +12,14 @@ Three ablation conditions are run for each (model, behavior) pair:
   C. Schedule (ramp vs flat):
      All middle layers with ramped K (formula) vs flat K (mean).
 
-Generation and judging are fully decoupled:
-  Phase 1 — run all generations, collect records
-  Phase 2 — load SmallModelJudge, batch-score all records at once
-  Phase 3 — aggregate scores, write CSVs and plots
+Generation and scoring are fully decoupled:
+  Phase 1 — run all generations, checkpoint raw_generations.csv
+  Phase 2 — activation-space scoring via ActivationJudge (same main model, no aux judge)
+             score = cosine_sim(last-token hidden state at target_layer, behavioral direction)
+  Phase 3 — aggregate + plot per ablation
+
+Replaces SmallModelJudge (Qwen2.5-3B) with activation-space scoring from the
+AVAW / norms-k-calibration evaluator pattern — eliminates judge collapse risk.
 
 Usage:
     python experiments/03_single_layer_ablation.py \\
@@ -25,8 +29,7 @@ Usage:
         --output-dir results/ablation \\
         --model llama-3.1-8b-instruct \\
         --behavior sycophancy \\
-        [--judge-model Qwen/Qwen2.5-1.5B-Instruct] \\
-        [--judge-batch-size 16] \\
+        [--judge-batch-size 8] \\
         [--max-new-tokens 150] \\
         [--load-in-4bit]
 """
@@ -48,7 +51,7 @@ import yaml
 from tqdm import tqdm
 
 from activation_baking.direction_extractor import load_directions
-from activation_baking.judges import SmallModelJudge
+from activation_baking.judges import ActivationJudge
 from activation_baking.model_utils import format_prompt, load_model_and_tokenizer
 from activation_baking.steerer import ActivationSteerer
 
@@ -242,9 +245,11 @@ def plot_k_sweep(df: pd.DataFrame, behavior: str, model_name: str, fig_dir: Path
     ax.plot(agg["k_scale"], agg["judge_score"], marker="o", lw=2, color="#2563eb")
     ax.axvline(x=1.0, color="#dc2626", ls="--", lw=1.2, label="K = K_ℓ (formula)")
     ax.set_xlabel("K scale (× formula K_ℓ)")
-    ax.set_ylabel("Mean judge score")
+    ax.set_ylabel("Cosine sim to behavioral direction")
     ax.set_title(f"{model_name} | {behavior} — K sweep")
-    ax.set_ylim(0, 1)
+    y_vals = agg["judge_score"]
+    margin = max(0.05, (y_vals.max() - y_vals.min()) * 0.3)
+    ax.set_ylim(max(-1.0, y_vals.min() - margin), min(1.0, y_vals.max() + margin))
     ax.legend()
     ax.grid(True, alpha=0.3)
     _savefig(fig, fig_dir / "k_sweep.pdf")
@@ -257,9 +262,11 @@ def plot_depth_ablation(df: pd.DataFrame, behavior: str, model_name: str, fig_di
     ax.plot(agg["inject_layer"], agg["judge_score"], marker="o", lw=2, color="#16a34a")
     ax.axvline(x=target_layer, color="#dc2626", ls="--", lw=1.2, label="Target layer l*")
     ax.set_xlabel("Injection layer")
-    ax.set_ylabel("Mean judge score")
+    ax.set_ylabel("Cosine sim to behavioral direction")
     ax.set_title(f"{model_name} | {behavior} — injection depth")
-    ax.set_ylim(0, 1)
+    y_vals = agg["judge_score"]
+    margin = max(0.05, (y_vals.max() - y_vals.min()) * 0.3)
+    ax.set_ylim(max(-1.0, y_vals.min() - margin), min(1.0, y_vals.max() + margin))
     ax.legend()
     ax.grid(True, alpha=0.3)
     _savefig(fig, fig_dir / "depth_ablation.pdf")
@@ -271,9 +278,11 @@ def plot_schedule(df: pd.DataFrame, behavior: str, model_name: str, fig_dir: Pat
     fig, ax = plt.subplots(figsize=(4, 4))
     for _, row in agg.iterrows():
         ax.bar(row["schedule"], row["judge_score"], color=colors.get(row["schedule"], "gray"))
-    ax.set_ylabel("Mean judge score")
+    ax.set_ylabel("Cosine sim to behavioral direction")
     ax.set_title(f"{model_name} | {behavior} — ramp vs flat")
-    ax.set_ylim(0, 1)
+    y_vals = agg["judge_score"]
+    margin = max(0.05, (y_vals.max() - y_vals.min()) * 0.3)
+    ax.set_ylim(max(-1.0, y_vals.min() - margin), min(1.0, y_vals.max() + margin))
     ax.grid(True, axis="y", alpha=0.3)
     _savefig(fig, fig_dir / "schedule_ablation.pdf")
 
@@ -297,7 +306,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ablations", nargs="*",
                         default=["k_sweep", "depth", "schedule"],
                         choices=["k_sweep", "depth", "schedule"])
-    parser.add_argument("--judge-model", default=SmallModelJudge.DEFAULT_MODEL)
     parser.add_argument("--judge-batch-size", type=int, default=8)
     return parser.parse_args()
 
@@ -375,12 +383,19 @@ def main() -> None:
     logger.info("Raw generations saved → %s/raw_generations.csv", out_dir)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # PHASE 2: Batch judge all records
+    # PHASE 2: Activation-space scoring (same model, no auxiliary judge)
     # ─────────────────────────────────────────────────────────────────────────
-    logger.info("=== Phase 2: Batch judging %d records ===", len(all_records))
-    judge = SmallModelJudge(model_id=args.judge_model)
-    scores = judge.score_records(all_records, batch_size=args.judge_batch_size)
-    judge.unload()
+    logger.info("=== Phase 2: Activation scoring %d records at layer %d ===",
+                len(all_records), target_layer)
+    direction_map = {d.layer_idx: d.mean_direction for d in directions}
+    judge = ActivationJudge(
+        model=model,
+        tokenizer=tokenizer,
+        direction_map=direction_map,
+    )
+    scores = judge.score_records(
+        all_records, target_layer=target_layer, batch_size=args.judge_batch_size
+    )
 
     for rec, score in zip(all_records, scores):
         rec["judge_score"] = score
