@@ -1,3 +1,4 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
@@ -5,11 +6,27 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# OS
 .DS_Store
-results/*.csv
-results/*.json
-figures/*.pdf
-figures/*.png
+
+# Secrets / environment
+.env
+
+# Downloaded data (re-generate with: python data/download_datasets.py)
+data/mtbench_questions.jsonl
+data/eval_prompts/
+
+# Generated results and figures (re-generate by running experiments)
+results/*/
+figures/*/
+
+# Keep gitkeep sentinels
+!results/.gitkeep
+!figures/.gitkeep
+
+# Model weights
 *.safetensors
 *.bin
-.env
+*.pt
+*.ckpt
