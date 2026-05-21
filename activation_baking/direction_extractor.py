@@ -1,5 +1,7 @@
 """Behavioral direction extraction via contrastive activation differences."""
 
+from __future__ import annotations
+
 import gc
 import logging
 import math
@@ -13,6 +15,8 @@ from sklearn.decomposition import PCA
 from tqdm import tqdm
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
+from activation_baking.config import ModelConfig
+
 logger = logging.getLogger(__name__)
 
 _UNSET = object()  # sentinel for optional completion_start
@@ -20,63 +24,133 @@ _UNSET = object()  # sentinel for optional completion_start
 
 @dataclass
 class BehavioralDirection:
-    """Extracted behavioral direction for a single layer."""
+    """Extracted behavioral direction for a single transformer layer.
+
+    Attributes:
+        layer_idx:           Index of the transformer layer this direction was
+                             extracted from.
+        k_value:             Calibrated injection magnitude for this layer, equal
+                             to the layer's formula-derived K (μ̄_ℓ / √d) at
+                             extraction time.
+        pca_direction:       Leading principal component of the contrastive
+                             activation differences; unit-norm, shape
+                             ``(hidden_size,)``.
+        mean_direction:      Normalised mean of the contrastive activation
+                             differences; unit-norm, shape ``(hidden_size,)``.
+        pca_variance_ratio:  Fraction of total variance in the diff matrix
+                             explained by the leading PC.
+    """
 
     layer_idx: int
     k_value: float
-    pca_direction: np.ndarray    # leading PC of contrastive diffs, shape (hidden_size,)
-    mean_direction: np.ndarray   # normalised mean diff, shape (hidden_size,)
-    pca_variance_ratio: float    # variance explained by PC1
+    pca_direction: np.ndarray
+    mean_direction: np.ndarray
+    pca_variance_ratio: float
 
 
 class DirectionExtractor:
     """Extracts per-layer behavioral directions from contrastive prompt pairs.
 
-    For each middle layer l, stacks activation differences
-    ΔH_l = H_l(positive) - H_l(negative) into a matrix and extracts:
-      - PCA direction: leading principal component of ΔH_l
-      - Mean direction: mean(ΔH_l) / ||mean(ΔH_l)||
+    For each middle layer ℓ (indices spanning the middle 50% of the network),
+    stacks activation differences ΔH_ℓ = H_ℓ(positive) − H_ℓ(negative) into a
+    matrix and extracts two complementary direction estimates:
 
-    Both directions are unit-normalised and ready for steering or baking.
+    - **PCA direction**: the leading principal component of ΔH_ℓ, capturing the
+      axis of maximum variance across the contrastive pairs.
+    - **Mean direction**: mean(ΔH_ℓ) / ‖mean(ΔH_ℓ)‖, capturing the average
+      shift in representation.
+
+    Both directions are unit-normalised and ready for steering (see
+    ``steerer.ActivationSteerer``) or persistent weight baking (see
+    ``baker.ModelBaker``).
+
+    Attributes are intentionally private; interact via ``extract()``.
+
+    Example::
+
+        extractor = DirectionExtractor(model, tokenizer, model_cfg, k_values)
+        directions = extractor.extract(pos_prompts, neg_prompts, contexts=ctxs)
+        save_directions(directions, "safety_directions.npz")
     """
 
     def __init__(
         self,
         model: PreTrainedModel,
         tokenizer: PreTrainedTokenizerBase,
-        hidden_size: int,
-        num_layers: int,
+        model_cfg: ModelConfig,
         k_values: dict[int, float],
         max_length: int = 512,
     ) -> None:
+        """
+        Args:
+            model:       HuggingFace causal LM with a ``model.model.layers``
+                         attribute.
+            tokenizer:   Corresponding tokenizer; pad token must be set.
+            model_cfg:   ``ModelConfig`` for the loaded model.  ``hidden_size``
+                         and ``num_layers`` are read from this object.
+            k_values:    Mapping of ``layer_idx → K`` injection magnitude.
+                         Layers not present default to 0.0.
+            max_length:  Maximum tokenized sequence length; longer inputs are
+                         truncated.
+        """
         self._model = model
         self._tokenizer = tokenizer
-        self._hidden_size = hidden_size
-        self._num_layers = num_layers
+        self._hidden_size: int = model_cfg.hidden_size
+        self._num_layers: int = model_cfg.num_layers
         self._k_values = k_values
         self._max_length = max_length
-        self._device = next(model.parameters()).device
+        self._device: torch.device = next(model.parameters()).device
         self._hooks: list = []
         self._activations: dict[int, list[np.ndarray]] = {}
-        self._completion_start: int = 0  # tokens before completion; 0 = full sequence
+        self._completion_start: int = 0
+
+    # ------------------------------------------------------------------
+    # Layer selection
+    # ------------------------------------------------------------------
 
     @property
     def middle_layers(self) -> list[int]:
+        """Layer indices spanning the middle 50% of the network.
+
+        Returns:
+            Sorted list of integer layer indices from ``num_layers // 4`` to
+            ``(3 * num_layers) // 4 − 1`` inclusive.
+        """
         start = self._num_layers // 4
         end = (3 * self._num_layers) // 4
         return list(range(start, end))
 
+    # ------------------------------------------------------------------
+    # Hook construction
+    # ------------------------------------------------------------------
+
     def _make_hook(self, layer_idx: int) -> Callable:
+        """Return a forward hook that captures mean-pooled hidden states.
+
+        When ``_completion_start > 0``, pooling is restricted to the token
+        positions following that index, isolating the completion representation
+        from the shared context prefix.
+
+        Args:
+            layer_idx: Index of the transformer layer being hooked.
+
+        Returns:
+            A callable compatible with ``register_forward_hook``.
+        """
         def hook(module: nn.Module, input: tuple, output: tuple | torch.Tensor) -> None:
             hidden: torch.Tensor = output[0] if isinstance(output, tuple) else output
             start = self._completion_start
-            # pool over completion tokens only when a context boundary is set
             segment = hidden[:, start:, :] if start > 0 and start < hidden.shape[1] else hidden
             vec = segment.detach().float().mean(dim=1).squeeze(0).cpu().numpy()
             self._activations[layer_idx].append(vec)
         return hook
 
+    # ------------------------------------------------------------------
+    # Hook lifecycle
+    # ------------------------------------------------------------------
+
     def _register_hooks(self) -> None:
+        """Register forward hooks on all middle layers."""
         for idx in self.middle_layers:
             self._activations[idx] = []
             handle = self._model.model.layers[idx].register_forward_hook(
@@ -85,28 +159,42 @@ class DirectionExtractor:
             self._hooks.append(handle)
 
     def _remove_hooks(self) -> None:
+        """Remove all currently registered forward hooks."""
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
+
+    # ------------------------------------------------------------------
+    # Activation collection
+    # ------------------------------------------------------------------
 
     def _collect_activations(
         self,
         prompts: list[str],
         context_lens: list[int] | None = None,
     ) -> dict[int, np.ndarray]:
-        """Run prompts through model, return per-layer activation matrix (n, d).
+        """Run prompts through the model and return per-layer activation matrices.
+
+        Each matrix has shape ``(n_prompts, hidden_size)``, containing the
+        mean-pooled hidden state at that layer for each prompt.
 
         Args:
-            prompts: Full tokenizable strings (context + completion).
-            context_lens: If provided, pool activations over completion tokens only.
-                          Each entry is the number of context tokens for that prompt.
+            prompts:      Full tokenizable strings (context + completion).
+            context_lens: If provided, pool activations over completion tokens
+                          only.  Each entry is the number of context tokens for
+                          the corresponding prompt.
+
+        Returns:
+            Mapping of ``layer_idx → np.ndarray`` of shape ``(n, hidden_size)``.
         """
         for idx in self.middle_layers:
             self._activations[idx] = []
 
         self._register_hooks()
         try:
-            for i, prompt in enumerate(tqdm(prompts, desc="  collecting", dynamic_ncols=True, leave=False)):
+            for i, prompt in enumerate(
+                tqdm(prompts, desc="  collecting", dynamic_ncols=True, leave=False)
+            ):
                 self._completion_start = context_lens[i] if context_lens is not None else 0
                 inputs = self._tokenizer(
                     prompt,
@@ -125,6 +213,10 @@ class DirectionExtractor:
 
         return {idx: np.stack(self._activations[idx]) for idx in self.middle_layers}
 
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def extract(
         self,
         pos_prompts: list[str],
@@ -134,17 +226,29 @@ class DirectionExtractor:
     ) -> list[BehavioralDirection]:
         """Extract behavioral directions from contrastive prompt pairs.
 
+        Passes both prompt sets through the model, computes per-layer activation
+        differences ΔH_ℓ = H_ℓ(pos) − H_ℓ(neg), and fits PCA to obtain both a
+        PCA direction (leading PC) and a mean direction (normalised mean diff).
+
         Args:
-            pos_prompts: Full strings (context + positive completion).
-            neg_prompts: Full strings (context + negative completion).
-            n_pca_components: Number of PCA components to fit (PC1 is used).
-            contexts: Raw context strings shared by both poles. When provided,
-                      activations are pooled over completion tokens only, giving
-                      a sharper directional estimate uncontaminated by the
-                      identical context prefix.
+            pos_prompts:      Full strings (context + positive completion), one
+                              per contrastive pair.
+            neg_prompts:      Full strings (context + negative completion);
+                              must be the same length as ``pos_prompts``.
+            n_pca_components: Number of PCA components to fit.  Only PC1 is
+                              retained; higher values improve numerical stability.
+            contexts:         Raw context strings shared by both poles.  When
+                              provided, activations are pooled over completion
+                              tokens only, yielding a sharper directional estimate
+                              uncontaminated by the identical context prefix.
 
         Returns:
-            One BehavioralDirection per middle layer, sorted by layer index.
+            List of ``BehavioralDirection`` objects, one per middle layer,
+            sorted by ascending layer index.
+
+        Raises:
+            AssertionError: If ``pos_prompts`` and ``neg_prompts`` lengths differ,
+                            or if ``contexts`` length does not match the pair count.
         """
         assert len(pos_prompts) == len(neg_prompts), \
             "Positive and negative prompt counts must match."
@@ -172,7 +276,6 @@ class DirectionExtractor:
         for layer_idx in self.middle_layers:
             diff = pos_acts[layer_idx] - neg_acts[layer_idx]  # (n, d)
 
-            # PCA direction
             n_comp = min(n_pca_components, diff.shape[0] - 1)
             pca = PCA(n_components=n_comp)
             pca.fit(diff)
@@ -180,7 +283,6 @@ class DirectionExtractor:
             pca_dir = pca_dir / (np.linalg.norm(pca_dir) + 1e-8)
             var_ratio = float(pca.explained_variance_ratio_[0])
 
-            # Mean diff direction
             mean_diff = diff.mean(axis=0)
             mean_dir = mean_diff / (np.linalg.norm(mean_diff) + 1e-8)
 
@@ -193,14 +295,34 @@ class DirectionExtractor:
             ))
 
         gc.collect()
+        logger.info(
+            "Extracted directions for %d layers (layers %d–%d).",
+            len(directions),
+            directions[0].layer_idx,
+            directions[-1].layer_idx,
+        )
         return directions
+
+
+# ---------------------------------------------------------------------------
+# Persistence helpers
+# ---------------------------------------------------------------------------
 
 
 def save_directions(
     directions: list[BehavioralDirection],
     path: str,
 ) -> None:
-    """Persist directions to a .npz archive."""
+    """Persist a list of behavioral directions to a compressed ``.npz`` archive.
+
+    The archive stores five parallel arrays keyed by field name.  Reload with
+    ``load_directions``.
+
+    Args:
+        directions: Output of ``DirectionExtractor.extract()``.
+        path:       Destination file path; ``.npz`` extension appended by NumPy
+                    if absent.
+    """
     np.savez(
         path,
         layer_indices=np.array([d.layer_idx for d in directions]),
@@ -209,12 +331,24 @@ def save_directions(
         mean_directions=np.stack([d.mean_direction for d in directions]),
         pca_variance_ratios=np.array([d.pca_variance_ratio for d in directions]),
     )
+    logger.info("Saved %d directions to %s.", len(directions), path)
 
 
 def load_directions(path: str) -> list[BehavioralDirection]:
-    """Load directions from a .npz archive."""
+    """Load behavioral directions from a ``.npz`` archive.
+
+    Args:
+        path: Path to the archive produced by ``save_directions``.
+
+    Returns:
+        List of ``BehavioralDirection`` objects in the order they were saved.
+
+    Raises:
+        OSError:   If the file does not exist or cannot be opened.
+        KeyError:  If the archive is missing expected array keys.
+    """
     data = np.load(path)
-    return [
+    directions = [
         BehavioralDirection(
             layer_idx=int(data["layer_indices"][i]),
             k_value=float(data["k_values"][i]),
@@ -224,3 +358,5 @@ def load_directions(path: str) -> list[BehavioralDirection]:
         )
         for i in range(len(data["layer_indices"]))
     ]
+    logger.info("Loaded %d directions from %s.", len(directions), path)
+    return directions

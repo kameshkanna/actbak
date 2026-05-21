@@ -4,6 +4,8 @@ Adds K·direction to the residual stream at configured transformer layers withou
 modifying model weights. For persistent weight-level baking see baker.py.
 """
 
+from __future__ import annotations
+
 import logging
 from contextlib import contextmanager
 from typing import Generator

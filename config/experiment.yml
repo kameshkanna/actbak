@@ -1,0 +1,36 @@
+# Experiment runtime configuration.
+# All values map 1-to-1 onto ExperimentConfig fields in activation_baking/config.py.
+
+experiment:
+
+  # Behavioral axes
+  behaviors:
+    - safety
+    - refusal
+    - sycophancy
+
+  # K multipliers for the ramp magnitude sweep
+  k_scales: [0.0, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0]
+
+  # Generation budget per prompt
+  max_new_tokens: 150
+
+  # Judge model (SmallModelJudge)
+  judge_model: Qwen/Qwen2.5-3B-Instruct
+  judge_batch_size: 8
+
+  # Evaluation sample counts
+  # Increase to >=50 for publication; 20 is fine for rapid iteration
+  n_harmbench:   50
+  n_clearharm:   50
+  n_advbench:    50
+  n_truthfulqa:  50
+  n_gsm8k:       100
+  n_mmlu:        100
+
+  # Reproducibility
+  seed: 42
+
+  # Output roots
+  results_dir: results
+  figures_dir: figures

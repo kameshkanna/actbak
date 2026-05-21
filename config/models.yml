@@ -1,28 +1,93 @@
+# Model registry for activation baking experiments.
+#
+# Each entry defines one model variant.  Instruct models list their
+# base_counterpart so the pipeline can automatically pair them for the
+# base-vs-instruct asymmetry analysis.
+#
+# Fields
+# ------
+# name             : short slug used as directory key throughout the pipeline
+# hf_id            : HuggingFace model identifier
+# norm_type        : "pre" (standard pre-RMSNorm) | "pre_post" (Gemma-2 dual-norm)
+# hidden_size      : residual stream dimension d
+# num_layers       : total transformer layer count
+# dtype            : "bfloat16" (default) | "float16"
+# is_instruct      : true = RLHF/instruction-tuned; false = base model
+# base_counterpart : name of the base model config (instruct models only)
+# extra            : arbitrary kwargs forwarded to tokenizer / chat-template calls
+
 models:
+
+  # ── Llama 3.1 8B ─────────────────────────────────────────────────────────
   - name: llama-3.1-8b-instruct
     hf_id: meta-llama/Meta-Llama-3.1-8B-Instruct
     norm_type: pre
     hidden_size: 4096
     num_layers: 32
     dtype: bfloat16
+    is_instruct: true
+    base_counterpart: llama-3.1-8b
 
+  - name: llama-3.1-8b
+    hf_id: meta-llama/Meta-Llama-3.1-8B
+    norm_type: pre
+    hidden_size: 4096
+    num_layers: 32
+    dtype: bfloat16
+    is_instruct: false
+
+  # ── Mistral 7B ───────────────────────────────────────────────────────────
+  - name: mistral-7b-instruct
+    hf_id: mistralai/Mistral-7B-Instruct-v0.2
+    norm_type: pre
+    hidden_size: 4096
+    num_layers: 32
+    dtype: bfloat16
+    is_instruct: true
+    base_counterpart: mistral-7b
+
+  - name: mistral-7b
+    hf_id: mistralai/Mistral-7B-v0.1
+    norm_type: pre
+    hidden_size: 4096
+    num_layers: 32
+    dtype: bfloat16
+    is_instruct: false
+
+  # ── Qwen 2.5 7B ──────────────────────────────────────────────────────────
   - name: qwen2.5-7b-instruct
     hf_id: Qwen/Qwen2.5-7B-Instruct
     norm_type: pre
     hidden_size: 3584
     num_layers: 28
     dtype: bfloat16
+    is_instruct: true
+    base_counterpart: qwen2.5-7b
 
+  - name: qwen2.5-7b
+    hf_id: Qwen/Qwen2.5-7B
+    norm_type: pre
+    hidden_size: 3584
+    num_layers: 28
+    dtype: bfloat16
+    is_instruct: false
+
+  # ── Gemma 2 9B ───────────────────────────────────────────────────────────
+  # norm_type: pre_post — dual RMSNorm; K_l integrates accumulated gamma^post
+  # scales rather than raw MLP spectral norms (same formula, different proxy).
   - name: gemma-2-9b-it
     hf_id: google/gemma-2-9b-it
     norm_type: pre_post
     hidden_size: 3584
     num_layers: 42
     dtype: bfloat16
+    is_instruct: true
+    base_counterpart: gemma-2-9b
 
-  - name: phi-4-14b-instruct
-    hf_id: microsoft/phi-4
-    norm_type: pre
-    hidden_size: 5120
-    num_layers: 40
+  - name: gemma-2-9b
+    hf_id: google/gemma-2-9b
+    norm_type: pre_post
+    hidden_size: 3584
+    num_layers: 42
     dtype: bfloat16
+    is_instruct: false

@@ -10,6 +10,8 @@ Four scorers are provided:
 - ``SmallModelJudge``: (legacy) loads a small local LLM and scores responses in batches.
 """
 
+from __future__ import annotations
+
 import logging
 import math
 import re
