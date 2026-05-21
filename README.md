@@ -56,6 +56,27 @@ source .venv/bin/activate
 
 Requires Python ≥ 3.10 and a CUDA GPU. All four model pairs fit on a single 40 GB A100 in bfloat16.
 
+### Dataset download
+
+```bash
+# Download everything (reads sample counts from config/experiment.yml)
+python data/download_datasets.py
+
+# Or selectively
+python data/download_datasets.py --only mtbench harmbench_eval clearharm_eval
+python data/download_datasets.py --only gsm8k mmlu truthfulqa harmbench_hf
+
+# Override sample counts
+python data/download_datasets.py --n-harmbench 100 --n-clearharm 100 --seed 0
+```
+
+| Dataset | Used by | Source |
+|---|---|---|
+| MT-Bench 80 prompts | Experiment 01 (norm profiling) | FastChat GitHub |
+| HarmBench eval JSONL | Experiment 03 (ramp steering) | HarmBench GitHub CSV |
+| ClearHarm eval JSONL | Experiment 03 (ramp steering) | HuggingFace |
+| GSM8K, MMLU, TruthfulQA, HarmBench | Experiment 04 (baking eval) | HuggingFace (auto-cached) |
+
 ---
 
 ## Pipeline
@@ -65,11 +86,8 @@ Each script loads a model **once** via `ModelRegistry` — no redundant loads ac
 ### 1 — Norm Profiling
 
 ```bash
-# Download MT-Bench prompts (once)
-python data/download_mtbench.py
-
 # Profile all models
-python experiments/01_norm_profiling.py --config config/models.yml
+python experiments/01_norm_profiling.py
 
 # Or single model
 python experiments/01_norm_profiling.py --models llama-3.1-8b-instruct
