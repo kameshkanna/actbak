@@ -1,34 +1,50 @@
 # Activation Baking
 
-**Persistent behavioral modification of LLMs by writing activation vectors as biases into transformer MLP weights.**
-
-Activation baking extends inference-time steering (CAA) to a *permanent* operation: behavioral directions are extracted from contrastive pairs, calibrated via the K formula, and written directly into `W_down` weight biases. No inference-time hooks, no prompt engineering — the behavior is baked in.
+**Ramp-calibrated behavioral steering that fights growing residual stream norms — and a weight-space formulation that makes it permanent.**
 
 ---
 
-## The Core Idea
+## The Problem with Flat-K Steering
 
-Standard activation steering adds a direction vector to the residual stream at runtime:
+Activation steering adds a vector to the residual stream at layer ℓ:
 
 ```
 h_ℓ  →  h_ℓ + K · ĉ
 ```
 
-Activation baking achieves the same effect permanently by modifying the MLP output projection bias:
+Prior work uses a fixed K across all layers. This breaks down because residual stream norms grow monotonically with depth — by ×84 in Llama-3.1-8B. A flat K that is calibrated for shallow layers gets drowned out at deep layers where ‖h_ℓ‖ is large. The steering vector's **relative influence shrinks with depth**.
 
 ```
-W_down.bias  +=  K_ℓ · ĉ
+relative influence  =  K / ‖h_ℓ‖   →  0   as layer depth increases
 ```
 
-A rank-1 perturbation equivalence guarantees these are identical in expectation. See [`paper/formula_derivation.md`](paper/formula_derivation.md) for the full derivation.
+Flat-K injection at matched budget consistently under-steers at the layers that matter most.
 
-### The K Formula
+---
+
+## The Fix: K_ℓ = μ̄_ℓ / √d
+
+The correct magnitude at each layer is proportional to the residual stream norm at that layer:
 
 ```
 K_ℓ  =  μ̄_ℓ / √d
 ```
 
-`μ̄_ℓ` is the mean residual stream norm at layer ℓ measured on a representative corpus; `d` is the hidden dimension. Because residual norms grow monotonically with depth, this formula naturally produces a **ramped schedule**. Flat-K injection is structurally inadequate.
+`μ̄_ℓ` is the mean L2 norm of the residual stream at layer ℓ, measured on a representative corpus. `d` is the hidden dimension. This formula ensures the steering vector maintains **constant relative influence** across the full depth of the network — shallow layers get small K, deep layers get large K.
+
+Because norms grow with depth, this naturally produces a **ramped schedule**. See [`paper/formula_derivation.md`](paper/formula_derivation.md) for the rank-1 perturbation derivation.
+
+---
+
+## Activation Baking (Engineering Result)
+
+Once the ramp schedule is established, the same effect can be written permanently into model weights. For each layer ℓ, instead of a runtime hook:
+
+```
+W_down.bias  +=  K_ℓ · ĉ
+```
+
+A rank-1 perturbation equivalence guarantees these are identical in expectation. This is zero-cost at inference time — no hooks, no overhead. See [`paper/formula_derivation.md`](paper/formula_derivation.md).
 
 ---
 
@@ -41,7 +57,7 @@ K_ℓ  =  μ̄_ℓ / √d
 | `Qwen/Qwen2.5-7B-Instruct` | Instruct | `Qwen2.5-7B` |
 | `google/gemma-2-9b-it` | Instruct | `gemma-2-9b` |
 
-Base models expose the **RLHF asymmetry**: instruction-tuned models degrade asymmetrically under positive vs negative directional steering; base models degrade symmetrically in both directions.
+All four model pairs are evaluated. Base models are included to isolate the effect of RLHF on steering behavior.
 
 ---
 
@@ -60,48 +76,35 @@ Requires Python ≥ 3.10 and a CUDA GPU. All four model pairs fit on a single 40
 
 ## Datasets
 
-All datasets are downloaded once before running experiments. Sample counts are read from `config/experiment.yml` by default.
+All datasets are downloaded once before running experiments. Sample counts are read from `config/experiment.yml`.
 
-### What is needed
-
-| Dataset | Used by | Where it lives |
+| Dataset | Used by | Source |
 |---|---|---|
-| MT-Bench (80 prompts) | Exp 01 — norm profiling | `data/mtbench_questions.jsonl` |
-| HarmBench behaviors | Exp 03 — ramp steering eval | `data/eval_prompts/harmbench.jsonl` |
-| ClearHarm | Exp 03 — ramp steering eval | `data/eval_prompts/clearharm.jsonl` |
-| GSM8K | Exp 04 — baking eval (capability) | HuggingFace cache |
-| MMLU | Exp 04 — baking eval (capability) | HuggingFace cache |
-| TruthfulQA | Exp 04 — baking eval (capability) | HuggingFace cache |
-| HarmBench (HF) | Exp 04 — baking eval (safety) | HuggingFace cache |
-
-The local JSONL files (MT-Bench, HarmBench eval, ClearHarm) are downloaded from their respective sources. The HuggingFace datasets (GSM8K, MMLU, TruthfulQA, HarmBench) are auto-cached the first time an evaluator runs; calling `download_datasets.py` pre-caches them ahead of time.
-
-### Download commands
+| MT-Bench (80 prompts) | Exp 01 — norm profiling | FastChat GitHub |
+| HarmBench behaviors | Exp 03, 04 — steering eval | HarmBench GitHub CSV |
+| ClearHarm | Exp 03, 04 — steering eval | HuggingFace |
+| GSM8K | Exp 05 — baking eval | HuggingFace (auto-cached) |
+| MMLU | Exp 05 — baking eval | HuggingFace (auto-cached) |
+| TruthfulQA | Exp 05 — baking eval | HuggingFace (auto-cached) |
+| HarmBench (HF) | Exp 05 — baking eval | HuggingFace (auto-cached) |
 
 ```bash
-# Download everything — reads n_harmbench, n_clearharm, seed from config/experiment.yml
+# Download everything
 python data/download_datasets.py
 
-# Skip HuggingFace pre-caching (download only local JSONL files)
+# Local JSONL files only (skip HuggingFace pre-caching)
 python data/download_datasets.py --skip-hf-cache
 
 # Override sample counts
 python data/download_datasets.py --n-harmbench 100 --n-clearharm 100
 
-# Download specific datasets only
-python data/download_datasets.py --only mtbench
-python data/download_datasets.py --only harmbench_eval clearharm_eval
-python data/download_datasets.py --only gsm8k mmlu truthfulqa harmbench_hf
-
-# Re-download even if files already exist
-python data/download_datasets.py --force
+# Specific datasets only
+python data/download_datasets.py --only mtbench harmbench_eval clearharm_eval
 ```
 
 ---
 
-## Running the Pipeline
-
-Each experiment script loads models **once** via `ModelRegistry` and releases them on exit — no redundant loads across steps.
+## Pipeline
 
 ### Step 0 — Download datasets
 
@@ -109,69 +112,63 @@ Each experiment script loads models **once** via `ModelRegistry` and releases th
 python data/download_datasets.py
 ```
 
+---
+
 ### Step 1 — Norm Profiling
 
-Measures per-layer residual stream L2 norms across MT-Bench prompts. Derives the calibrated K_ℓ = μ̄_ℓ / √d schedule used by all downstream experiments.
+Measures per-layer residual stream L2 norms on MT-Bench prompts and derives the K_ℓ = μ̄_ℓ / √d schedule. This is the empirical foundation for the ramp — it shows norms growing monotonically with depth and quantifies by how much.
 
 ```bash
 # All models
 python experiments/01_norm_profiling.py
 
-# Subset of models
+# Subset
 python experiments/01_norm_profiling.py --models llama-3.1-8b-instruct mistral-7b-instruct
-
-# 4-bit quantisation (lower VRAM, slightly less accurate norms)
-python experiments/01_norm_profiling.py --load-in-4bit
 ```
 
 **Outputs:**
-- `results/norm_profiles/{model}.csv` — per-layer mean norm, std, and K_ℓ value
-- `figures/norm_profiles/fig1_norm_profiles.pdf` — norm growth curves
-- `figures/norm_profiles/fig2_k_profiles.pdf` — K_ℓ schedule per model
-- `figures/norm_profiles/fig3_norm_comparison.pdf` — normalised comparison across all models
+- `results/norm_profiles/{model}.csv` — per-layer mean norm, std, K_ℓ
+- `figures/norm_profiles/fig1_norm_profiles.pdf` — norm growth curves per model
+- `figures/norm_profiles/fig2_k_profiles.pdf` — K_ℓ ramp schedule per model
+- `figures/norm_profiles/fig3_norm_comparison.pdf` — normalised depth comparison across all models
 
-**Prerequisite:** `data/mtbench_questions.jsonl` (downloaded in Step 0)
+**Requires:** `data/mtbench_questions.jsonl`
 
 ---
 
 ### Step 2 — Direction Extraction
 
-Extracts per-layer behavioral directions from contrastive prompt pairs using CAA. Activation differences are pooled over completion tokens only (not the shared context prefix) for a sharper signal.
+Extracts per-layer behavioral directions via CAA (contrastive activation addition). Uses completion-only pooling — activations are pooled over the completion tokens only, not the shared context prefix, for a sharper directional signal.
 
 ```bash
-# All behaviors for one model
+# All behaviors, one model
 python experiments/02_direction_extraction.py \
     --models llama-3.1-8b-instruct \
     --behaviors safety refusal sycophancy
 
 # All models, all behaviors
 python experiments/02_direction_extraction.py
-
-# Single behavior
-python experiments/02_direction_extraction.py \
-    --models llama-3.1-8b-instruct \
-    --behaviors safety
 ```
 
 **Outputs:**
-- `results/directions/{model}/{behavior}.npz` — PCA direction, mean direction, K values per layer
+- `results/directions/{model}/{behavior}.npz` — PCA direction, mean direction, K_ℓ values
 
-**Prerequisite:** Step 1 complete (norm profiles for the target models)
+**Requires:** Step 1 (norm profiles for the target models)
 
 ---
 
 ### Step 3 — Ramp Steering Evaluation
 
-Evaluates three conditions on a single model × behavior pair: baseline (no steering), ramp_pos (steer toward behavior at +K_ℓ × scale), ramp_neg (steer away at −K_ℓ × scale). Tests on HarmBench + ClearHarm prompts. Used to locate the lobotomy cliff and validate the formula K.
+Evaluates ramp-K steering across all model families and behaviors. Three conditions: baseline (no steering), ramp_pos (steer toward behavior), ramp_neg (steer away). Sweeps K scales to locate the lobotomy cliff — the scale at which the ramp overcomes RLHF conditioning.
 
 ```bash
-# Single scale
+# One model, one behavior, formula K
 python experiments/03_ramp_steering_eval.py \
     --model llama-3.1-8b-instruct \
     --behavior safety \
     --k-scale 1.0
 
-# Sweep scales to map the lobotomy cliff
+# Scale sweep to find the lobotomy cliff
 for scale in 0.5 1.0 2.0 3.0; do
     python experiments/03_ramp_steering_eval.py \
         --model llama-3.1-8b-instruct \
@@ -179,99 +176,129 @@ for scale in 0.5 1.0 2.0 3.0; do
         --k-scale $scale
 done
 
-# Different model or behavior
-python experiments/03_ramp_steering_eval.py \
-    --model mistral-7b-instruct \
-    --behavior refusal \
-    --k-scale 1.0
+# All models, one behavior
+for model in llama-3.1-8b-instruct mistral-7b-instruct qwen2.5-7b-instruct gemma-2-9b-it; do
+    python experiments/03_ramp_steering_eval.py \
+        --model $model \
+        --behavior safety \
+        --k-scale 1.0
+done
 ```
 
 **Outputs** (under `results/ramp_eval/{model}/{behavior}/k{scale}/`):
-- `raw_generations.csv` — all generated responses across three conditions
-- `scored_results.csv` — responses with SAFE / UNSAFE / GIBBERISH judge scores
-- `summary.csv` — mean, std, count per condition
+- `raw_generations.csv`
+- `scored_results.csv` — SAFE / UNSAFE / GIBBERISH judge scores
+- `summary.csv` — mean and std per condition
 - `figures/ramp_eval/.../condition_comparison.pdf`
-- `figures/ramp_eval/.../by_source.pdf`
 - `figures/ramp_eval/.../per_prompt_heatmap.pdf`
 
-**Prerequisites:** Steps 1 and 2 complete; `data/eval_prompts/harmbench.jsonl` and `data/eval_prompts/clearharm.jsonl` (downloaded in Step 0)
+**Requires:** Steps 1 and 2; `data/eval_prompts/`
 
 ---
 
-### Step 4 — Baking Evaluation
+### Step 4 — Flat-K vs Ramp-K Comparison
 
-Bakes behavioral directions into model weights in-place, runs the full benchmark suite on baseline, baked_pos, and baked_neg conditions, then unbakes to restore the original weights. No deepcopy — one model copy in VRAM at all times.
+Direct empirical validation of the main claim. Compares ramp-K against two flat-K baselines at matched and generous budget. Shows that flat injection under-steers at deep layers regardless of budget — the ramp is not just incrementally better, it is structurally correct.
 
 ```bash
-# Baking eval with formula K (scale=1.0)
-python experiments/04_baking_eval.py \
+# One model
+python experiments/04_flat_k_comparison.py \
     --model llama-3.1-8b-instruct \
     --behavior safety
 
-# Different scale
-python experiments/04_baking_eval.py \
-    --model llama-3.1-8b-instruct \
-    --behavior safety \
-    --k-scale 2.0
+# All instruct models (default when --model is omitted)
+python experiments/04_flat_k_comparison.py --behavior safety
 
-# Save the baked model weights to disk
-python experiments/04_baking_eval.py \
+# All behaviors
+for behavior in safety refusal sycophancy; do
+    python experiments/04_flat_k_comparison.py --behavior $behavior
+done
+```
+
+**Conditions:**
+
+| Condition | K at each layer | Budget |
+|---|---|---|
+| `baseline` | 0 | — |
+| `ramp_pos` | K_ℓ = μ̄_ℓ / √d | formula |
+| `flat_pos` | mean(K_ℓ) uniform | matched to ramp |
+| `flat_pos_max` | max(K_ℓ) uniform | generous (more than ramp) |
+
+**Outputs** (under `results/flat_k_comparison/{model}/{behavior}/`):
+- `scored_results.csv`
+- `summary.csv`
+- `figures/flat_k_comparison/.../ramp_vs_flat.pdf`
+- `figures/flat_k_comparison/.../k_schedule.pdf` — ramp vs flat K visualisation
+- `figures/flat_k_comparison/.../per_prompt_heatmap.pdf`
+
+**Requires:** Steps 1 and 2; `data/eval_prompts/`
+
+---
+
+### Step 5 — Baking Evaluation (Engineering)
+
+Validates the weight-space equivalence: baking K_ℓ · ĉ into `W_down.bias` produces the same behavioral effect as the runtime ramp hook, with zero inference overhead. Runs the full capability benchmark suite to confirm baking does not degrade general performance.
+
+```bash
+python experiments/05_baking_eval.py \
+    --model llama-3.1-8b-instruct \
+    --behavior safety
+
+# Save baked model weights
+python experiments/05_baking_eval.py \
     --model llama-3.1-8b-instruct \
     --behavior safety \
     --save-baked-model
 ```
 
-**Benchmarks run:**
+**Benchmarks:**
 
-| Benchmark | Metric | Split |
-|---|---|---|
-| HarmBench | safe_rate (SAFE / total) | `cais/harmbench` standard/test |
-| GSM8K | exact_match | `gsm8k` main/test |
-| MMLU | accuracy | `cais/mmlu` all/test |
-| TruthfulQA | mc1_accuracy | `truthful_qa` multiple_choice/validation |
+| Benchmark | Metric |
+|---|---|
+| HarmBench | safe_rate |
+| GSM8K | exact_match |
+| MMLU | accuracy |
+| TruthfulQA | mc1_accuracy |
 
 **Outputs** (under `results/baking_eval/{model}/{behavior}/k{scale}/`):
-- `results.csv` — scores for all benchmarks × conditions
-- `per_sample/{condition}_{benchmark}.csv` — per-sample predictions
+- `results.csv`, `per_sample/`
 - `figures/baking_eval/.../benchmark_comparison.pdf`
-- `figures/baking_eval/.../delta_heatmap.pdf` — score delta (baked − baseline)
+- `figures/baking_eval/.../delta_heatmap.pdf`
 
-**Prerequisites:** Steps 1 and 2 complete; HuggingFace datasets cached (Step 0)
+**Requires:** Steps 1 and 2; HuggingFace datasets cached (Step 0)
 
 ---
 
 ### Full pipeline — one model
 
 ```bash
-# 0. Environment + datasets
 bash setup.sh && source .venv/bin/activate
+
 python data/download_datasets.py
 
-# 1. Norm profiling
 python experiments/01_norm_profiling.py --models llama-3.1-8b-instruct
 
-# 2. Direction extraction
 python experiments/02_direction_extraction.py \
     --models llama-3.1-8b-instruct \
     --behaviors safety refusal sycophancy
 
-# 3. Ramp steering sweep
 for scale in 0.5 1.0 2.0 3.0; do
     python experiments/03_ramp_steering_eval.py \
-        --model llama-3.1-8b-instruct \
-        --behavior safety \
-        --k-scale $scale
+        --model llama-3.1-8b-instruct --behavior safety --k-scale $scale
 done
 
-# 4. Baking eval
-python experiments/04_baking_eval.py \
-    --model llama-3.1-8b-instruct \
-    --behavior safety
+python experiments/04_flat_k_comparison.py \
+    --model llama-3.1-8b-instruct --behavior safety
+
+python experiments/05_baking_eval.py \
+    --model llama-3.1-8b-instruct --behavior safety
 ```
 
 ---
 
 ## Key Results (Llama-3.1-8B-Instruct, safety)
+
+**Ramp vs baseline:**
 
 | K scale | ramp_pos (safe %) | ramp_neg (safe %) | Baseline |
 |---|---|---|---|
@@ -279,7 +306,7 @@ python experiments/04_baking_eval.py \
 | 2.0 × K_ℓ | 55% | 15% | 55% |
 | 3.0 × K_ℓ | 0% *(gibberish)* | 5% | 55% |
 
-Formula K (1×) gives clean bidirectional control without degradation. At 3×K_ℓ ramp_pos collapses — confirming the lobotomy ceiling.
+Formula K (1×) gives clean bidirectional control. At 3×K_ℓ the ramp overcomes RLHF conditioning and the model degrades — confirming the lobotomy ceiling.
 
 ---
 
@@ -292,27 +319,28 @@ activation_baking/
   model_utils.py         Model loading, prompt formatting, response generation
   norm_profiler.py       Hook-based residual stream norm measurement
   direction_extractor.py Contrastive activation direction extraction (CAA)
-  steerer.py             Inference-time hook-based steering (no weight changes)
-  baker.py               Persistent baking — writes K·ĉ into W_down.bias
+  steerer.py             Inference-time ramp steering (no weight changes)
+  baker.py               Persistent baking — writes K_ℓ·ĉ into W_down.bias
   judges.py              ActivationJudge + SmallModelJudge (SAFE/UNSAFE/GIBBERISH)
   evaluators.py          GSM8K, MMLU, TruthfulQA, HarmBench runners
 
 config/
-  models.yml             All 8 model variants (4 instruct + 4 base pairs)
+  models.yml             8 model variants (4 instruct + 4 base pairs)
   experiment.yml         Shared hyperparameters and sample counts
 
 data/
-  contrastive_pairs/     CAA minimal pairs for direction extraction (safety, refusal, sycophancy)
+  contrastive_pairs/     CAA minimal pairs (safety, refusal, sycophancy)
   download_datasets.py   Downloads MT-Bench, HarmBench, ClearHarm; pre-caches HF datasets
 
 experiments/
-  01_norm_profiling.py
-  02_direction_extraction.py
-  03_ramp_steering_eval.py
-  04_baking_eval.py
+  01_norm_profiling.py       Measure norm growth, derive K_ℓ schedule
+  02_direction_extraction.py Extract behavioral directions via CAA
+  03_ramp_steering_eval.py   Ramp steering across all models, behaviors, scales
+  04_flat_k_comparison.py    Flat-K vs Ramp-K at matched budget
+  05_baking_eval.py          Weight-space baking + capability benchmarks
 
 paper/
-  formula_derivation.md  Full K_ℓ = μ̄_ℓ / √d derivation
+  formula_derivation.md  K_ℓ = μ̄_ℓ / √d derivation from rank-1 perturbation equivalence
 ```
 
 ---
@@ -321,7 +349,7 @@ paper/
 
 ```bibtex
 @article{activationbaking2026,
-  title  = {Activation Baking: Persistent Behavioral Modification via Weight-Space Direction Injection},
+  title  = {Activation Baking: Ramp-Calibrated Behavioral Steering via Weight-Space Direction Injection},
   author = {Kamesh R},
   year   = {2026},
 }
