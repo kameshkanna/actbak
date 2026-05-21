@@ -257,6 +257,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--load-in-4bit", action="store_true")
     parser.add_argument("--judge-model", default=SmallModelJudge.DEFAULT_MODEL)
     parser.add_argument("--judge-batch-size", type=int, default=8)
+    parser.add_argument("--k-scale", type=float, default=1.0,
+                        help="Multiply all K values by this factor. "
+                             "Try 0.5, 1.0, 2.0, 5.0 to find the degradation cliff.")
     return parser.parse_args()
 
 
@@ -273,9 +276,10 @@ def main() -> None:
     model_cfg = model_cfgs[args.model]
     extra_cfg = model_cfg.get("extra", {})
 
-    out_dir = Path(args.output_dir) / args.model / args.behavior
+    scale_tag = f"k{args.k_scale:.2f}".replace(".", "p")
+    out_dir = Path(args.output_dir) / args.model / args.behavior / scale_tag
     out_dir.mkdir(parents=True, exist_ok=True)
-    fig_dir = Path("figures") / "ramp_eval" / args.model / args.behavior
+    fig_dir = Path("figures") / "ramp_eval" / args.model / args.behavior / scale_tag
 
     # ── Directions ────────────────────────────────────────────────────────────
     dir_path = Path(args.directions) / args.model / f"{args.behavior}.npz"
@@ -298,15 +302,15 @@ def main() -> None:
 
     # ── Build steering configs ────────────────────────────────────────────────
     configs = {
-        "baseline": {},                                         # empty config = no hooks
-        "ramp_pos": steerer.build_ramp_config(directions, scale=1.0),
-        "ramp_neg": steerer.build_ramp_config(directions, scale=-1.0),
+        "baseline": {},
+        "ramp_pos": steerer.build_ramp_config(directions, scale=args.k_scale),
+        "ramp_neg": steerer.build_ramp_config(directions, scale=-args.k_scale),
     }
 
     k_vals = [v for _, v in configs["ramp_pos"].values()]
     logger.info(
-        "Ramp config: %d layers | K range [%.4f, %.4f]",
-        len(k_vals), min(k_vals), max(k_vals),
+        "Ramp config: k_scale=%.2f | %d layers | K range [%.4f, %.4f]",
+        args.k_scale, len(k_vals), min(k_vals), max(k_vals),
     )
 
     # ─────────────────────────────────────────────────────────────────────────
