@@ -19,14 +19,12 @@ experiment:
   judge_model: Qwen/Qwen2.5-3B-Instruct
   judge_batch_size: 8
 
-  # Evaluation sample counts
-  # Increase to >=50 for publication; 20 is fine for rapid iteration
-  n_harmbench:   50
-  n_clearharm:   50
-  n_advbench:    50
-  n_truthfulqa:  50
-  n_gsm8k:       100
-  n_mmlu:        100
+  # Evaluation sample counts (capped at 500 for now)
+  n_harmbench:   200
+  n_clearharm:   200
+  n_gsm8k:       500
+  n_mmlu:        500
+  n_truthfulqa:  500
 
   # Reproducibility
   seed: 42
