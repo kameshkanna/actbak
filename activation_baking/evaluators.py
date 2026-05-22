@@ -116,7 +116,7 @@ def _load_hf_dataset(path: str, name: str, split: str) -> Any:
     try:
         from datasets import load_dataset  # type: ignore[import-untyped]
 
-        dataset = load_dataset(path, name, split=split, trust_remote_code=True)
+        dataset = load_dataset(path, name, split=split)
         return dataset
     except Exception as exc:
         raise RuntimeError(
@@ -276,7 +276,7 @@ class GSM8KEvaluator(BaseEvaluator):
             raise ValueError(f"n_samples must be >= 1, got {n_samples}.")
 
         logger.info("Loading GSM8K dataset (config=main, split=test).")
-        dataset = _load_hf_dataset("gsm8k", "main", "test")
+        dataset = _load_hf_dataset("openai/gsm8k", "main", "test")
 
         rng = random.Random(seed)
         np.random.seed(seed)
@@ -569,7 +569,7 @@ class TruthfulQAEvaluator(BaseEvaluator):
             raise ValueError(f"n_samples must be >= 1, got {n_samples}.")
 
         logger.info("Loading TruthfulQA dataset (config=multiple_choice, split=validation).")
-        dataset = _load_hf_dataset("truthful_qa", "multiple_choice", "validation")
+        dataset = _load_hf_dataset("truthfulqa/truthful_qa", "multiple_choice", "validation")
 
         rng = random.Random(seed)
         np.random.seed(seed)
@@ -668,20 +668,24 @@ class HarmBenchEvaluator(BaseEvaluator):
 
     Metric: ``safe_rate``.
 
-    Dataset: ``cais/harmbench`` (config ``standard``, split ``test``, column ``Behavior``).
+    Dataset: local ``data/eval_prompts/harmbench.jsonl`` (downloaded by
+    ``data/download_datasets.py``), column ``prompt``.
     """
 
-    def __init__(self, judge: SmallModelJudge) -> None:
+    def __init__(self, judge: SmallModelJudge, jsonl_path: str = "data/eval_prompts/harmbench.jsonl") -> None:
         """
         Args:
             judge: A loaded :class:`~activation_baking.judges.SmallModelJudge`
                 instance used to classify each generated response.
+            jsonl_path: Path to the local HarmBench JSONL file produced by
+                ``data/download_datasets.py``.
         """
         if not isinstance(judge, SmallModelJudge):
             raise TypeError(
                 f"judge must be a SmallModelJudge instance, got {type(judge).__name__}."
             )
         self._judge = judge
+        self._jsonl_path = jsonl_path
 
     def evaluate(
         self,
@@ -705,27 +709,34 @@ class HarmBenchEvaluator(BaseEvaluator):
             (1.0=SAFE, 0.0=UNSAFE, -0.5=GIBBERISH), plus aggregate counts.
 
         Raises:
-            RuntimeError: If the dataset cannot be loaded.
+            RuntimeError: If the JSONL file cannot be loaded.
             ValueError: If ``n_samples < 1``.
             TypeError: If ``judge`` is not a :class:`~activation_baking.judges.SmallModelJudge`.
         """
+        import json
+        from pathlib import Path
+
         if n_samples < 1:
             raise ValueError(f"n_samples must be >= 1, got {n_samples}.")
 
-        logger.info("Loading HarmBench dataset (config=standard, split=test).")
-        dataset = _load_hf_dataset("cais/harmbench", "standard", "test")
+        jsonl_path = Path(self._jsonl_path)
+        if not jsonl_path.exists():
+            raise RuntimeError(
+                f"HarmBench JSONL not found at {jsonl_path}. "
+                "Run `python data/download_datasets.py` first."
+            )
+        logger.info("Loading HarmBench behaviors from %s.", jsonl_path)
+        rows: list[dict] = [json.loads(line) for line in jsonl_path.read_text().splitlines() if line.strip()]
 
         rng = random.Random(seed)
-        np.random.seed(seed)
-        indices = _sample_indices(len(dataset), n_samples, rng)
+        sampled = rng.sample(rows, min(n_samples, len(rows)))
 
         device = next(model.parameters()).device
         records: list[dict[str, Any]] = []
 
-        logger.info("Generating responses for %d HarmBench behaviors.", len(indices))
-        for idx in tqdm(indices, desc="HarmBench generate", dynamic_ncols=True):
-            item = dataset[idx]
-            behavior: str = item["Behavior"]
+        logger.info("Generating responses for %d HarmBench behaviors.", len(sampled))
+        for item in tqdm(sampled, desc="HarmBench generate", dynamic_ncols=True):
+            behavior: str = item["prompt"]
 
             prompt = _tokenize_and_truncate(tokenizer, behavior, max_tokens=512)
 

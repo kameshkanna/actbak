@@ -22,9 +22,6 @@ Dataset inventory
   truthfulqa       TruthfulQA multiple_choice/validation (HuggingFace cache)
                    Used by: experiment 04 (baking eval — TruthfulQAEvaluator)
 
-  harmbench_hf     cais/harmbench standard/test (HuggingFace cache)
-                   Used by: experiment 04 (baking eval — HarmBenchEvaluator)
-
 Sample counts for the JSONL files are read from config/experiment.yml by default
 and can be overridden per-dataset.
 
@@ -85,7 +82,6 @@ ALL_DATASETS = [
     "gsm8k",
     "mmlu",
     "truthfulqa",
-    "harmbench_hf",
 ]
 
 
@@ -200,7 +196,7 @@ def download_clearharm_eval(n: int, seed: int) -> list[dict]:
     logger.info("Loading ClearHarm from HuggingFace (AlignmentResearch/ClearHarm)...")
     try:
         from datasets import load_dataset  # type: ignore[import-untyped]
-        ds = load_dataset("AlignmentResearch/ClearHarm", split="train", trust_remote_code=True)
+        ds = load_dataset("AlignmentResearch/ClearHarm", split="train")
     except Exception as exc:
         raise RuntimeError(f"Failed to load ClearHarm: {exc}") from exc
 
@@ -233,14 +229,14 @@ def _cache_hf_dataset(path: str, name: str, split: str, label: str) -> None:
     try:
         from datasets import load_dataset  # type: ignore[import-untyped]
         logger.info("Pre-caching %s (%s/%s)...", label, name, split)
-        ds = load_dataset(path, name, split=split, trust_remote_code=True)
+        ds = load_dataset(path, name, split=split)
         logger.info("%s: %d examples cached.", label, len(ds))
     except Exception as exc:
         logger.warning("Could not cache %s: %s — will download at eval time.", label, exc)
 
 
 def cache_gsm8k() -> None:
-    _cache_hf_dataset("gsm8k", "main", "test", "GSM8K")
+    _cache_hf_dataset("openai/gsm8k", "main", "test", "GSM8K")
 
 
 def cache_mmlu() -> None:
@@ -248,11 +244,7 @@ def cache_mmlu() -> None:
 
 
 def cache_truthfulqa() -> None:
-    _cache_hf_dataset("truthful_qa", "multiple_choice", "validation", "TruthfulQA")
-
-
-def cache_harmbench_hf() -> None:
-    _cache_hf_dataset("cais/harmbench", "standard", "test", "HarmBench (HF)")
+    _cache_hf_dataset("truthfulqa/truthful_qa", "multiple_choice", "validation", "TruthfulQA")
 
 
 # ---------------------------------------------------------------------------
@@ -376,9 +368,6 @@ def main() -> None:
 
     if "truthfulqa" in targets:
         cache_truthfulqa()
-
-    if "harmbench_hf" in targets:
-        cache_harmbench_hf()
 
     logger.info("All done. Data directory: %s", DATA_DIR.resolve())
 
