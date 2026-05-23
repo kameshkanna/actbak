@@ -140,35 +140,33 @@ python experiments/03_ramp_steering_eval.py
 
 ## Ablations
 
-### Ablation 01 — Norm Calibration
+### Ablation 01 — Flat-K vs Ramp-K
 
-Demonstrates that K_ℓ is the correct operating point by steering a single layer at a time with K values spanning three orders of magnitude relative to ‖h_ℓ‖.
+Proves that ramp-K is necessary by showing flat-K (fixed mean K across all layers) fails. As residual stream norms grow monotonically with depth, a K calibrated at shallow layers has vanishing relative influence at deep layers (K / ‖h_ℓ‖ → 0). Ramp-K maintains constant relative influence at every layer.
 
-| K | Meaning | Expected outcome |
+| Condition | Description | Expected outcome |
 |---|---|---|
-| 0.1 × K_ℓ | Well below norm | Near-baseline score, weak steering |
-| 1.0 × K_ℓ | Formula value | Effective steering, coherent output |
-| 10.0 × K_ℓ | Far above norm | Residual stream blown out, gibberish |
-
-Targets layers at 40%, 50%, 60%, 70%, 80% depth — where concepts form.
+| baseline | No steering | Unsafe responses |
+| flat_K | All layers steered with K = mean(K_ℓ) | Weak deep-layer influence, partial safety |
+| ramp_K | All layers steered with K_ℓ = μ̄_ℓ / √d | Full safety, coherent output |
 
 ```bash
-python ablations/01_norm_calibration.py
+python ablations/01_flat_k_vs_ramp.py
 ```
 
-**Outputs:** `results/ablations/norm_calibration/{model}/`, `figures/ablations/norm_calibration/`
+**Outputs:** `results/ablations/flat_k_vs_ramp/{model}/`, `figures/ablations/flat_k_vs_ramp/`
 
 ---
 
-### Ablation 02 — Early-Middle Layer Reconstruction Capacity
+### Ablation 02 — Single-Layer Collapse
 
-When a model is steered heavily (K = 20× K_ℓ) at an early-middle layer (40–50% depth), can subsequent layers reconstruct a coherent output? This probes the model's implicit error-correction capacity.
+Steers a single layer at 10× K_ℓ — far above the operating point — at five depth targets (40%, 50%, 60%, 70%, 80%). Measures judge score and gibberish rate per layer to show that high-K single-layer injection collapses the residual stream into incoherent output, motivating distributed ramp steering.
 
 ```bash
-python ablations/02_reconstruction_capacity.py
+python ablations/02_single_layer_collapse.py
 ```
 
-**Outputs:** `results/ablations/reconstruction/{model}/layer_{pct}pct.jsonl`, `summary.txt`
+**Outputs:** `results/ablations/single_layer_collapse/{model}/`, `figures/ablations/single_layer_collapse/`
 
 ---
 
@@ -198,8 +196,8 @@ experiments/
   03_ramp_steering_eval.py   Ramp steering — all models, behaviors, K scales
 
 ablations/
-  01_norm_calibration.py     Single-layer K ablation at 40–80% depth
-  02_reconstruction_capacity.py  Early-middle heavy steering + recovery analysis
+  01_flat_k_vs_ramp.py       Flat K vs ramp K — proves depth-adaptive K is necessary
+  02_single_layer_collapse.py    Single high-K layer injection — shows residual collapse
 
 paper/
   formula_derivation.md  K_ℓ = μ̄_ℓ / √d derivation
