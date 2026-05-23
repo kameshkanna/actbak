@@ -59,6 +59,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 CONDITIONS = ["baseline", "ramp_pos", "ramp_neg"]
+STEER_CONDITIONS = ["ramp_pos", "ramp_neg"]
 CONDITION_COLORS = {"baseline": "#6b7280", "ramp_pos": "#2563eb", "ramp_neg": "#dc2626"}
 CONDITION_LABELS = {"baseline": "Baseline", "ramp_pos": "Ramp+", "ramp_neg": "Ramp−"}
 
@@ -221,18 +222,40 @@ def run_model(
     with registry.loaded(model_cfg) as (model, tokenizer):
         steerer = ActivationSteerer(model)
 
-        for behavior, scale in tqdm(list(product(behavior_directions.keys(), k_scales)),
-                                    desc=model_cfg.name, dynamic_ncols=True):
-            directions = behavior_directions[behavior]
-            configs = {
-                "baseline": {},
-                "ramp_pos": _ramp_config(directions, scale),
-                "ramp_neg": _neg_config(directions, scale),
+        # --- Baseline: run once per model, shared across all behaviors/scales ---
+        logger.info("  [%s | baseline]", model_cfg.name)
+        baseline_resps = generate_batched(
+            model, tokenizer, steerer, {},
+            prompts, exp_cfg.max_new_tokens, batch_size, model_cfg.extra,
+        )
+        baseline_records: list[dict] = [
+            {
+                "condition": "baseline", "behavior": "all",
+                "source": item["source"], "prompt_id": item["id"],
+                "user_input": item["prompt"], "response": resp,
             }
+            for item, resp in zip(eval_prompts, baseline_resps)
+        ]
+        baseline_scores = judge.score_records(baseline_records, batch_size=exp_cfg.judge_batch_size)
+        for rec, score in zip(baseline_records, baseline_scores):
+            rec["judge_score"] = score
+        baseline_out = output_root / model_cfg.name / "baseline"
+        baseline_out.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(baseline_records).to_csv(baseline_out / "scored_results.csv", index=False)
+        baseline_score_by_prompt = {rec["prompt_id"]: rec["judge_score"] for rec in baseline_records}
+        logger.info("  [%s | baseline] mean=%.3f", model_cfg.name,
+                    np.mean([r["judge_score"] for r in baseline_records]))
+
+        # --- K sweep: ramp_pos + ramp_neg only ---
+        sweep_combos = list(product(behavior_directions.keys(), k_scales))
+        for behavior, scale in tqdm(sweep_combos, desc=model_cfg.name, dynamic_ncols=True):
+            directions = behavior_directions[behavior]
             records: list[dict] = []
-            for condition in CONDITIONS:
+
+            for condition in STEER_CONDITIONS:
+                cfg = _ramp_config(directions, scale) if condition == "ramp_pos" else _neg_config(directions, scale)
                 logger.info("  [%s | %s | k=%.2f | %s]", model_cfg.name, behavior, scale, condition)
-                resps = generate_batched(model, tokenizer, steerer, configs[condition],
+                resps = generate_batched(model, tokenizer, steerer, cfg,
                                          prompts, exp_cfg.max_new_tokens, batch_size, model_cfg.extra)
                 for item, resp in zip(eval_prompts, resps):
                     records.append({
@@ -241,9 +264,19 @@ def run_model(
                         "user_input": item["prompt"], "response": resp,
                     })
 
-            scores = judge.score_records(records, batch_size=exp_cfg.judge_batch_size)
-            for rec, score in zip(records, scores):
-                rec["judge_score"] = score
+            # Inject baseline rows (already scored) so plots have all 3 conditions
+            for rec in baseline_records:
+                records.append({**rec, "behavior": behavior})
+
+            scores = judge.score_records(
+                [r for r in records if r["condition"] != "baseline"],
+                batch_size=exp_cfg.judge_batch_size,
+            )
+            scored_idx = 0
+            for rec in records:
+                if rec["condition"] != "baseline":
+                    rec["judge_score"] = scores[scored_idx]
+                    scored_idx += 1
 
             k_tag = f"k{scale:.2f}".replace(".", "_")
             out_dir = output_root / model_cfg.name / behavior / k_tag
