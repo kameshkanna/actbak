@@ -10,6 +10,13 @@ Behavior → benchmark mapping:
   safety     →  HarmBench + ClearHarm  (refusal scoring: SAFE / UNSAFE)
   sycophancy →  Anthropic model-written-evals  (SYCOPHANTIC / CONSISTENT)
 
+Skip logic: any (model, behavior, k_scale) whose scored_results.csv already
+exists is silently skipped.  Re-run from scratch with --force.
+
+Base model support: base models (is_instruct=False) are evaluated using the
+prompt_template defined in their extra config (models.yml).  By default only
+instruct models run; pass --include-base or name them explicitly via --models.
+
 Optimised for single GH200 (96 GB): one model load per model, judge loaded
 alongside main model (no unload/reload), batch_size=64.
 
@@ -17,11 +24,17 @@ Usage:
     # All instruct models, all behaviors, all K scales
     python experiments/03_ramp_steering_eval.py
 
-    # Subset
+    # Include base models alongside instruct
+    python experiments/03_ramp_steering_eval.py --include-base
+
+    # Explicit model list (instruct + base mixed)
     python experiments/03_ramp_steering_eval.py \\
-        --models llama-3.1-8b-instruct \\
+        --models llama-3.1-8b-instruct llama-3.1-8b \\
         --behaviors safety \\
         --k-scales 0.5 1.0 2.0
+
+    # Force re-run even if results already exist
+    python experiments/03_ramp_steering_eval.py --force
 
     # Tune batch size to GPU VRAM (GH200 default: 64)
     python experiments/03_ramp_steering_eval.py --batch-size 128
@@ -282,6 +295,26 @@ def plot_results(
 # Per-model runner
 # ---------------------------------------------------------------------------
 
+def _k_tag(scale: float) -> str:
+    return f"k{scale:.2f}".replace(".", "_")
+
+
+def _results_complete(
+    output_root: Path,
+    model_name: str,
+    behavior: str,
+    k_scales: list[float],
+) -> bool:
+    """Return True if all outputs for this model × behavior already exist."""
+    baseline_csv = output_root / model_name / behavior / "baseline" / "scored_results.csv"
+    if not baseline_csv.exists():
+        return False
+    return all(
+        (output_root / model_name / behavior / _k_tag(s) / "scored_results.csv").exists()
+        for s in k_scales
+    )
+
+
 def run_model(
     model_cfg: ModelConfig,
     behaviors: list[str],
@@ -293,26 +326,28 @@ def run_model(
     exp_cfg: ExperimentConfig,
     registry: ModelRegistry,
     batch_size: int,
+    force: bool = False,
 ) -> None:
     """Run the full ramp steering eval for one model across all behaviors and K scales.
 
     For each behavior:
-      - Loads behavior-specific eval prompts.
+      - Skips entirely if all outputs exist and ``force`` is False.
       - Runs baseline once (no steering hooks) and caches scores.
       - Sweeps K scales with ramp_pos and ramp_neg; injects cached baseline rows
         into each result DataFrame for unified plotting.
 
     Args:
-        model_cfg:    Config for the model to evaluate.
-        behaviors:    List of behavior names to evaluate.
-        k_scales:     K scale multipliers for the sweep.
-        eval_dir:     Directory containing behavior-specific JSONL eval prompt files.
+        model_cfg:      Config for the model to evaluate.
+        behaviors:      List of behavior names to evaluate.
+        k_scales:       K scale multipliers for the sweep.
+        eval_dir:       Directory containing behavior-specific JSONL eval prompt files.
         directions_dir: Root directory for extracted direction npz files.
-        output_root:  Root directory for CSV outputs.
-        figures_root: Root directory for PDF plots.
-        exp_cfg:      Loaded ExperimentConfig.
-        registry:     ModelRegistry instance.
-        batch_size:   Batch size for generation.
+        output_root:    Root directory for CSV outputs.
+        figures_root:   Root directory for PDF plots.
+        exp_cfg:        Loaded ExperimentConfig.
+        registry:       ModelRegistry instance.
+        batch_size:     Batch size for generation.
+        force:          If True, overwrite existing results; otherwise skip.
     """
     logger.info(
         "=== %s — %d behaviors × %d scales ===",
@@ -321,6 +356,9 @@ def run_model(
 
     behavior_directions: dict[str, list] = {}
     for behavior in behaviors:
+        if not force and _results_complete(output_root, model_cfg.name, behavior, k_scales):
+            logger.info("  [%s | %s] all results exist — skipping.", model_cfg.name, behavior)
+            continue
         p = directions_dir / model_cfg.name / f"{behavior}.npz"
         if not p.exists():
             logger.error("Directions missing: %s — run experiment 02 first.", p)
@@ -328,6 +366,7 @@ def run_model(
         behavior_directions[behavior] = load_directions(str(p))
 
     if not behavior_directions:
+        logger.info("=== %s — nothing to run ===", model_cfg.name)
         return
 
     judge = SmallModelJudge(model_id=exp_cfg.judge_model)
@@ -337,46 +376,63 @@ def run_model(
 
         for behavior in behavior_directions:
             eval_prompts = load_behavior_prompts(behavior, eval_dir)
-            prompts = [item["prompt"] for item in eval_prompts]
-            directions = behavior_directions[behavior]
+            prompts      = [item["prompt"] for item in eval_prompts]
+            directions   = behavior_directions[behavior]
 
             # ------------------------------------------------------------------
             # Baseline: run once per behavior (no hooks), cache scores
             # ------------------------------------------------------------------
-            logger.info("  [%s | %s | baseline]", model_cfg.name, behavior)
-            baseline_resps = generate_batched(
-                model, tokenizer, steerer, {},
-                prompts, exp_cfg.max_new_tokens, batch_size, model_cfg.extra,
-            )
-            baseline_records: list[dict] = [
-                {
-                    "condition":          "baseline",
-                    "behavior":           behavior,
-                    "source":             item["source"],
-                    "prompt_id":          item["id"],
-                    "user_input":         item["prompt"],
-                    "response":           resp,
-                    "sycophantic_answer": item.get("sycophantic_answer", ""),
-                    "honest_answer":      item.get("honest_answer", ""),
-                }
-                for item, resp in zip(eval_prompts, baseline_resps)
-            ]
-            baseline_scores = judge.score_records(baseline_records, batch_size=exp_cfg.judge_batch_size)
-            for rec, score in zip(baseline_records, baseline_scores):
-                rec["judge_score"] = score
-
             baseline_out = output_root / model_cfg.name / behavior / "baseline"
-            baseline_out.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame(baseline_records).to_csv(baseline_out / "scored_results.csv", index=False)
+            baseline_csv = baseline_out / "scored_results.csv"
+
+            if not force and baseline_csv.exists():
+                logger.info("  [%s | %s | baseline] exists — loading cached.", model_cfg.name, behavior)
+                baseline_records = pd.read_csv(baseline_csv).to_dict("records")
+            else:
+                logger.info("  [%s | %s | baseline]", model_cfg.name, behavior)
+                baseline_resps = generate_batched(
+                    model, tokenizer, steerer, {},
+                    prompts, exp_cfg.max_new_tokens, batch_size, model_cfg.extra,
+                )
+                baseline_records = [
+                    {
+                        "condition":          "baseline",
+                        "behavior":           behavior,
+                        "source":             item["source"],
+                        "prompt_id":          item["id"],
+                        "user_input":         item["prompt"],
+                        "response":           resp,
+                        "sycophantic_answer": item.get("sycophantic_answer", ""),
+                        "honest_answer":      item.get("honest_answer", ""),
+                    }
+                    for item, resp in zip(eval_prompts, baseline_resps)
+                ]
+                baseline_scores = judge.score_records(baseline_records, batch_size=exp_cfg.judge_batch_size)
+                for rec, score in zip(baseline_records, baseline_scores):
+                    rec["judge_score"] = score
+                baseline_out.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame(baseline_records).to_csv(baseline_csv, index=False)
+
             logger.info(
                 "  [%s | %s | baseline] mean_score=%.3f",
-                model_cfg.name, behavior, float(np.mean([r["judge_score"] for r in baseline_records])),
+                model_cfg.name, behavior,
+                float(np.mean([r["judge_score"] for r in baseline_records])),
             )
 
             # ------------------------------------------------------------------
             # K sweep: ramp_pos + ramp_neg only
             # ------------------------------------------------------------------
-            for scale in tqdm(k_scales, desc=f"{model_cfg.name}|{behavior}", dynamic_ncols=True):
+            pending_scales = [
+                s for s in k_scales
+                if force or not (
+                    output_root / model_cfg.name / behavior / _k_tag(s) / "scored_results.csv"
+                ).exists()
+            ]
+            if not pending_scales:
+                logger.info("  [%s | %s] all k-scales exist — skipping sweep.", model_cfg.name, behavior)
+                continue
+
+            for scale in tqdm(pending_scales, desc=f"{model_cfg.name}|{behavior}", dynamic_ncols=True):
                 records: list[dict] = []
 
                 for condition in STEER_CONDITIONS:
@@ -401,18 +457,15 @@ def run_model(
                             "honest_answer":      item.get("honest_answer", ""),
                         })
 
-                # Score only steer conditions; baseline already scored
                 steer_scores = judge.score_records(records, batch_size=exp_cfg.judge_batch_size)
                 for rec, score in zip(records, steer_scores):
                     rec["judge_score"] = score
 
-                # Inject cached baseline rows for unified per-scale DataFrames
                 all_records = records + [dict(r) for r in baseline_records]
 
-                k_tag = f"k{scale:.2f}".replace(".", "_")
-                out_dir = output_root / model_cfg.name / behavior / k_tag
+                out_dir = output_root / model_cfg.name / behavior / _k_tag(scale)
                 out_dir.mkdir(parents=True, exist_ok=True)
-                fig_dir = figures_root / model_cfg.name / behavior / k_tag
+                fig_dir = figures_root / model_cfg.name / behavior / _k_tag(scale)
 
                 df = pd.DataFrame(all_records)
                 df.to_csv(out_dir / "scored_results.csv", index=False)
@@ -440,16 +493,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-prompts",      default="data/eval_prompts")
     parser.add_argument("--output-dir",        default="results/ramp_eval")
     parser.add_argument("--figures-dir",       default="figures/ramp_eval")
-    parser.add_argument("--batch-size",  type=int,   default=64)
-    parser.add_argument("--models",    nargs="*", help="Default: all instruct models.")
-    parser.add_argument("--behaviors", nargs="*", help="Default: from experiment.yml.")
-    parser.add_argument("--k-scales",  nargs="*", type=float, help="Default: from experiment.yml.")
+    parser.add_argument("--batch-size",   type=int,   default=64)
+    parser.add_argument("--models",     nargs="*", help="Explicit list; overrides --include-base.")
+    parser.add_argument("--behaviors",  nargs="*", help="Default: from experiment.yml.")
+    parser.add_argument("--k-scales",   nargs="*", type=float, help="Default: from experiment.yml.")
+    parser.add_argument("--include-base", action="store_true",
+                        help="Also evaluate base (non-instruct) models.")
+    parser.add_argument("--force",        action="store_true",
+                        help="Overwrite existing results instead of skipping.")
     parser.add_argument("--load-in-4bit", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
-    args = parse_args()
+    args     = parse_args()
     all_configs = load_model_configs(args.config)
     exp_cfg     = load_experiment_config(args.experiment_config)
 
@@ -459,6 +516,8 @@ def main() -> None:
             logger.error("Unknown models: %s", missing)
             sys.exit(1)
         target_names = args.models
+    elif args.include_base:
+        target_names = list(all_configs)
     else:
         target_names = [n for n, c in all_configs.items() if c.is_instruct]
 
@@ -467,8 +526,8 @@ def main() -> None:
     registry  = ModelRegistry(load_in_4bit=args.load_in_4bit, device_map="cuda:0")
 
     logger.info(
-        "%d models × %d behaviors × %d k-scales | batch_size=%d",
-        len(target_names), len(behaviors), len(k_scales), args.batch_size,
+        "%d models × %d behaviors × %d k-scales | batch_size=%d | force=%s",
+        len(target_names), len(behaviors), len(k_scales), args.batch_size, args.force,
     )
 
     for name in target_names:
@@ -483,6 +542,7 @@ def main() -> None:
             exp_cfg=exp_cfg,
             registry=registry,
             batch_size=args.batch_size,
+            force=args.force,
         )
 
     logger.info("All done.")

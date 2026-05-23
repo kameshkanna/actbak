@@ -35,6 +35,8 @@ models:
     num_layers: 32
     dtype: bfloat16
     is_instruct: false
+    extra:
+      prompt_template: "### Instruction:\n{text}\n\n### Response:\n"
 
   # ── Mistral 7B ───────────────────────────────────────────────────────────
   - name: mistral-7b-instruct
@@ -53,6 +55,8 @@ models:
     num_layers: 32
     dtype: bfloat16
     is_instruct: false
+    extra:
+      prompt_template: "### Instruction:\n{text}\n\n### Response:\n"
 
   # ── Qwen 2.5 7B ──────────────────────────────────────────────────────────
   - name: qwen2.5-7b-instruct
@@ -71,6 +75,8 @@ models:
     num_layers: 28
     dtype: bfloat16
     is_instruct: false
+    extra:
+      prompt_template: "### Instruction:\n{text}\n\n### Response:\n"
 
   # ── Gemma 2 9B ───────────────────────────────────────────────────────────
   # norm_type: pre_post — dual RMSNorm; K_l integrates accumulated gamma^post
@@ -91,3 +97,5 @@ models:
     num_layers: 42
     dtype: bfloat16
     is_instruct: false
+    extra:
+      prompt_template: "### Instruction:\n{text}\n\n### Response:\n"

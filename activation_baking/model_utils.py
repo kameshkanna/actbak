@@ -103,6 +103,10 @@ def format_prompt(
         Formatted prompt string ready for tokenization.
     """
     extra_cfg = extra_cfg or {}
+
+    if "prompt_template" in extra_cfg:
+        return extra_cfg["prompt_template"].format(text=text)
+
     messages: list[dict[str, str]] = [{"role": "user", "content": text}]
 
     template_kwargs: dict[str, Any] = {
