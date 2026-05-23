@@ -121,6 +121,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--models", nargs="*")
     parser.add_argument("--load-in-4bit", action="store_true")
+    parser.add_argument(
+        "--device", default="cuda:0",
+        help="Single GPU to use (default: cuda:0). Override via CUDA_VISIBLE_DEVICES.",
+    )
     return parser.parse_args()
 
 
@@ -141,7 +145,7 @@ def main() -> None:
     norm_dir = Path(args.norm_profiles)
     output_dir = Path(args.output_dir)
 
-    registry = ModelRegistry(load_in_4bit=args.load_in_4bit)
+    registry = ModelRegistry(load_in_4bit=args.load_in_4bit, device_map=args.device)
 
     for name, model_cfg in selected.items():
         norm_path = norm_dir / f"{name}.csv"
