@@ -81,7 +81,7 @@ python data/download_datasets.py
 Measures per-layer residual stream L2 norms and derives the K_ℓ = μ̄_ℓ / √d schedule.
 
 ```bash
-python run_exp01.py
+python experiments/01_norm_profiling.py
 ```
 
 **Outputs:** `results/norm_profiles/{model}.csv`, `figures/norm_profiles/`
@@ -93,7 +93,7 @@ python run_exp01.py
 Extracts per-layer behavioral directions via CAA (contrastive activation addition) using completion-only pooling.
 
 ```bash
-python run_exp02.py
+python experiments/02_direction_extraction.py
 ```
 
 **Outputs:** `results/directions/{model}/{behavior}.npz`
@@ -105,15 +105,15 @@ python run_exp02.py
 Evaluates ramp-K steering across all model families and behaviors. Three conditions: `baseline`, `ramp_pos`, `ramp_neg`. Sweeps K scales to locate the lobotomy cliff.
 
 ```bash
-python run_exp03.py
+python experiments/03_ramp_steering_eval.py
 ```
 
 Flags:
 
 ```bash
-python run_exp03.py --batch-size 16                          # tune to GPU VRAM
-python run_exp03.py --models llama-3.1-8b-instruct           # single model
-python run_exp03.py --behaviors safety --k-scales 0.5 1.0    # subset
+python experiments/03_ramp_steering_eval.py --batch-size 16                          # tune to GPU VRAM
+python experiments/03_ramp_steering_eval.py --models llama-3.1-8b-instruct           # single model
+python experiments/03_ramp_steering_eval.py --behaviors safety --k-scales 0.5 1.0    # subset
 ```
 
 **Outputs:** `results/ramp_eval/{model}/{behavior}/k{scale}/scored_results.csv`, `figures/`
@@ -127,9 +127,9 @@ bash setup.sh && source .venv/bin/activate
 
 python data/download_datasets.py
 
-python run_exp01.py
-python run_exp02.py
-python run_exp03.py
+python experiments/01_norm_profiling.py
+python experiments/02_direction_extraction.py
+python experiments/03_ramp_steering_eval.py
 ```
 
 ---

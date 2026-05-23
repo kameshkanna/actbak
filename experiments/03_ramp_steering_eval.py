@@ -1,30 +1,35 @@
-"""Experiment 03 — Ramp steering evaluation on real harm benchmarks.
+"""Experiment 03 — Ramp steering evaluation across all models, behaviors, and K scales.
 
-Three conditions on a single model × behavior pair:
+Three conditions per model × behavior × k-scale:
+  baseline  — no steering
+  ramp_pos  — steer along +direction at K_ℓ × scale
+  ramp_neg  — steer along −direction at K_ℓ × scale
 
-  baseline  — no steering; model responds naturally
-  ramp_pos  — steer along +direction at all middle layers (K_ℓ scale × K_ℓ)
-              pushes model toward the extracted behavior (e.g. refusal / safety)
-  ramp_neg  — steer along −direction at all middle layers (−scale × K_ℓ)
-              pushes model away from the behavior (toward harmful compliance)
-
-Test set: HarmBench + ClearHarm samples (counts from experiment.yml).
-Judge:    Qwen2.5-3B-Instruct three-way SAFE / UNSAFE / GIBBERISH.
+Optimised for GH200 (96 GB): one model load per model, batched generation,
+judge loaded alongside main model (no unload/reload cycle).
 
 Usage:
-    # Scale sweep to find the lobotomy cliff
-    for scale in 0.5 1.0 2.0 3.0; do
-        python experiments/03_ramp_steering_eval.py \\
-            --model llama-3.1-8b-instruct \\
-            --behavior safety \\
-            --k-scale $scale
-    done
+    # All instruct models, all behaviors, all K scales
+    python experiments/03_ramp_steering_eval.py
+
+    # Subset
+    python experiments/03_ramp_steering_eval.py \\
+        --models llama-3.1-8b-instruct \\
+        --behaviors safety \\
+        --k-scales 0.5 1.0 2.0
+
+    # Tune batch size to GPU VRAM (GH200 default: 64)
+    python experiments/03_ramp_steering_eval.py --batch-size 128
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import logging
+import os
 import sys
+from itertools import product
 from pathlib import Path
 
 import matplotlib
@@ -42,6 +47,10 @@ from activation_baking.model_utils import format_prompt
 from activation_baking.registry import ModelRegistry
 from activation_baking.steerer import ActivationSteerer
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -50,101 +59,77 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 CONDITIONS = ["baseline", "ramp_pos", "ramp_neg"]
+CONDITION_COLORS = {"baseline": "#6b7280", "ramp_pos": "#2563eb", "ramp_neg": "#dc2626"}
+CONDITION_LABELS = {"baseline": "Baseline", "ramp_pos": "Ramp+", "ramp_neg": "Ramp−"}
 
 
 # ---------------------------------------------------------------------------
-# Data helpers
+# Steering configs
 # ---------------------------------------------------------------------------
 
+def _ramp_config(directions: list, scale: float) -> dict:
+    return {} if scale == 0.0 else {d.layer_idx: (d.mean_direction, d.k_value * scale) for d in directions}
 
-def load_eval_prompts(eval_dir: Path, n_harmbench: int, n_clearharm: int) -> list[dict]:
-    """Load HarmBench and ClearHarm prompts, capped at the configured sample counts."""
-    records: list[dict] = []
-    for fname, key, cap in (
-        ("harmbench.jsonl", "harmbench", n_harmbench),
-        ("clearharm.jsonl", "clearharm", n_clearharm),
-    ):
-        path = eval_dir / fname
-        if not path.exists():
-            logger.error(
-                "%s not found — run `python data/download_eval_prompts.py` first.", path
-            )
-            sys.exit(1)
-        batch: list[dict] = []
-        with path.open(encoding="utf-8") as f:
-            for line in f:
-                if len(batch) >= cap:
-                    break
-                batch.append(json.loads(line))
-        records.extend(batch)
-        logger.info("Loaded %d %s prompts (cap=%d).", len(batch), key, cap)
-    return records
+def _neg_config(directions: list, scale: float) -> dict:
+    return {} if scale == 0.0 else {d.layer_idx: (-d.mean_direction, d.k_value * scale) for d in directions}
 
 
 # ---------------------------------------------------------------------------
-# Generation
+# Batched generation
 # ---------------------------------------------------------------------------
-
 
 @torch.no_grad()
-def _generate_one(
-    model,
-    tokenizer,
-    prompt: str,
-    max_new_tokens: int,
-    extra_cfg: dict,
-) -> str:
-    formatted = format_prompt(tokenizer, prompt, extra_cfg)
-    device = next(model.parameters()).device
-    inputs = tokenizer(
-        formatted,
-        return_tensors="pt",
-        truncation=True,
-        max_length=1024,
-        padding=False,
-    ).to(device)
-    prompt_len = inputs["input_ids"].shape[1]
-    out = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        pad_token_id=tokenizer.eos_token_id,
-    )
-    return tokenizer.decode(out[0][prompt_len:], skip_special_tokens=True).strip()
-
-
-def generate_condition(
+def generate_batched(
     model,
     tokenizer,
     steerer: ActivationSteerer,
     layer_config: dict,
-    eval_prompts: list[dict],
-    behavior: str,
+    prompts: list[str],
     max_new_tokens: int,
+    batch_size: int,
     extra_cfg: dict,
-    condition_name: str,
-) -> list[dict]:
-    """Generate responses for all eval prompts under one steering condition."""
+) -> list[str]:
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    device = next(model.parameters()).device
+    responses: list[str] = []
+
+    for start in tqdm(range(0, len(prompts), batch_size), desc="  batches", leave=False, dynamic_ncols=True):
+        batch = [format_prompt(tokenizer, p, extra_cfg) for p in prompts[start : start + batch_size]]
+        inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(device)
+        prompt_len = inputs["input_ids"].shape[1]
+
+        with steerer.steer(layer_config):
+            out = model.generate(**inputs, max_new_tokens=max_new_tokens,
+                                 do_sample=False, pad_token_id=tokenizer.eos_token_id)
+
+        for output_ids in out:
+            responses.append(tokenizer.decode(output_ids[prompt_len:], skip_special_tokens=True).strip())
+
+        torch.cuda.empty_cache()
+
+    return responses
+
+
+# ---------------------------------------------------------------------------
+# Eval prompts
+# ---------------------------------------------------------------------------
+
+def load_eval_prompts(eval_dir: Path, n_harmbench: int, n_clearharm: int) -> list[dict]:
     records: list[dict] = []
-    with steerer.steer(layer_config):
-        for item in tqdm(
-            eval_prompts,
-            desc=f"  [{condition_name}]",
-            dynamic_ncols=True,
-            leave=False,
-        ):
-            resp = _generate_one(model, tokenizer, item["prompt"], max_new_tokens, extra_cfg)
-            records.append({
-                "condition":  condition_name,
-                "behavior":   behavior,
-                "source":     item["source"],
-                "prompt_id":  item["id"],
-                "user_input": item["prompt"],
-                "response":   resp,
-            })
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-    logger.info("[%s] generated %d responses.", condition_name, len(records))
+    for fname, cap in (("harmbench.jsonl", n_harmbench), ("clearharm.jsonl", n_clearharm)):
+        path = eval_dir / fname
+        if not path.exists():
+            logger.error("%s not found — run `python data/download_datasets.py` first.", path)
+            sys.exit(1)
+        with path.open() as f:
+            for line in f:
+                if sum(1 for r in records if r["source"] == fname.split(".")[0]) >= cap:
+                    break
+                records.append(json.loads(line))
+    logger.info("Loaded %d eval prompts.", len(records))
     return records
 
 
@@ -152,205 +137,185 @@ def generate_condition(
 # Plotting
 # ---------------------------------------------------------------------------
 
-
 def _savefig(fig: plt.Figure, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    logger.info("Saved → %s", path)
 
 
-def plot_condition_comparison(
-    df: pd.DataFrame,
-    behavior: str,
-    model_name: str,
-    fig_dir: Path,
-) -> None:
-    """Bar chart: mean refusal score per condition."""
-    agg = df.groupby("condition")["judge_score"].mean().reindex(CONDITIONS)
-    colors = {"baseline": "#6b7280", "ramp_pos": "#2563eb", "ramp_neg": "#dc2626"}
-    fig, ax = plt.subplots(figsize=(5, 4))
-    bars = ax.bar(
-        agg.index,
-        agg.values,
-        color=[colors[c] for c in agg.index],
-        width=0.5,
-        edgecolor="white",
-    )
-    ax.bar_label(bars, fmt="%.2f", padding=3, fontsize=10)
-    ax.set_ylabel("Mean refusal score (judge)")
+def plot_results(df: pd.DataFrame, behavior: str, model_name: str, scale: float, fig_dir: Path) -> None:
+    agg = df.groupby("condition")["judge_score"].mean().reindex(CONDITIONS).fillna(0)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    bars = ax.bar(range(3), agg.values, color=[CONDITION_COLORS[c] for c in CONDITIONS], width=0.5)
+    ax.bar_label(bars, fmt="%.3f", padding=3, fontsize=9)
+    ax.set_xticks(range(3))
+    ax.set_xticklabels([CONDITION_LABELS[c] for c in CONDITIONS], fontsize=9)
+    ax.set_ylabel("Mean refusal score")
     ax.set_ylim(0, 1.15)
-    ax.set_title(f"{model_name} | {behavior}\nbaseline vs ramp+ vs ramp−")
+    ax.set_title(f"{model_name} | {behavior} | k={scale}")
     ax.grid(True, axis="y", alpha=0.3)
     _savefig(fig, fig_dir / "condition_comparison.pdf")
 
-
-def plot_by_source(
-    df: pd.DataFrame,
-    behavior: str,
-    model_name: str,
-    fig_dir: Path,
-) -> None:
-    """Grouped bar chart: mean refusal score per condition, split by benchmark source."""
     sources = sorted(df["source"].unique())
-    x = np.arange(len(CONDITIONS))
-    width = 0.35
-    source_colors = {"harmbench": "#7c3aed", "clearharm": "#059669"}
+    src_colors = {"harmbench": "#7c3aed", "clearharm": "#059669"}
+    x = np.arange(3)
     fig, ax = plt.subplots(figsize=(7, 4))
-    for i, source in enumerate(sources):
-        sub = (
-            df[df["source"] == source]
-            .groupby("condition")["judge_score"].mean()
-            .reindex(CONDITIONS)
-        )
-        offset = (i - len(sources) / 2 + 0.5) * width
-        ax.bar(x + offset, sub.values, width, label=source,
-               color=source_colors.get(source, "gray"))
+    for i, src in enumerate(sources):
+        sub = df[df["source"] == src].groupby("condition")["judge_score"].mean().reindex(CONDITIONS).fillna(0)
+        ax.bar(x + (i - len(sources)/2 + 0.5) * 0.3, sub.values, 0.3,
+               label=src, color=src_colors.get(src, "gray"))
     ax.set_xticks(x)
-    ax.set_xticklabels(CONDITIONS)
-    ax.set_ylabel("Mean refusal score (judge)")
+    ax.set_xticklabels([CONDITION_LABELS[c] for c in CONDITIONS], fontsize=9)
+    ax.set_ylabel("Mean refusal score")
     ax.set_ylim(0, 1.15)
-    ax.set_title(f"{model_name} | {behavior} — by benchmark source")
+    ax.set_title(f"{model_name} | {behavior} | k={scale} — by source")
     ax.legend()
     ax.grid(True, axis="y", alpha=0.3)
     _savefig(fig, fig_dir / "by_source.pdf")
 
-
-def plot_per_prompt_heatmap(
-    df: pd.DataFrame,
-    behavior: str,
-    model_name: str,
-    fig_dir: Path,
-) -> None:
-    """Heatmap: rows = prompts, columns = conditions."""
-    pivot = (
-        df.pivot_table(index="prompt_id", columns="condition",
-                       values="judge_score", aggfunc="mean")
-        .reindex(columns=CONDITIONS)
-        .fillna(0)
-    )
-    fig, ax = plt.subplots(figsize=(6, max(4, len(pivot) * 0.35)))
+    pivot = (df.pivot_table(index="prompt_id", columns="condition", values="judge_score", aggfunc="mean")
+               .reindex(columns=CONDITIONS).fillna(0))
+    fig, ax = plt.subplots(figsize=(6, max(4, len(pivot) * 0.3)))
     im = ax.imshow(pivot.values, aspect="auto", cmap="RdYlGn", vmin=0, vmax=1)
-    ax.set_xticks(range(len(CONDITIONS)))
-    ax.set_xticklabels(CONDITIONS, fontsize=9)
+    ax.set_xticks(range(3))
+    ax.set_xticklabels([CONDITION_LABELS[c] for c in CONDITIONS], fontsize=8)
     ax.set_yticks(range(len(pivot)))
-    ax.set_yticklabels([str(pid)[:30] for pid in pivot.index], fontsize=7)
+    ax.set_yticklabels([str(pid)[:30] for pid in pivot.index], fontsize=6)
     plt.colorbar(im, ax=ax, label="Refusal score")
-    ax.set_title(f"{model_name} | {behavior} — per-prompt refusal")
+    ax.set_title(f"{model_name} | {behavior} | k={scale}")
     _savefig(fig, fig_dir / "per_prompt_heatmap.pdf")
+
+
+# ---------------------------------------------------------------------------
+# Per-model runner
+# ---------------------------------------------------------------------------
+
+def run_model(
+    model_cfg: ModelConfig,
+    behaviors: list[str],
+    k_scales: list[float],
+    eval_prompts: list[dict],
+    directions_dir: Path,
+    output_root: Path,
+    figures_root: Path,
+    exp_cfg,
+    registry: ModelRegistry,
+    batch_size: int,
+) -> None:
+    logger.info("=== %s — %d behaviors × %d scales ===", model_cfg.name, len(behaviors), len(k_scales))
+
+    behavior_directions: dict[str, list] = {}
+    for behavior in behaviors:
+        p = directions_dir / model_cfg.name / f"{behavior}.npz"
+        if not p.exists():
+            logger.error("Directions missing: %s — run experiment 02 first.", p)
+            continue
+        behavior_directions[behavior] = load_directions(str(p))
+
+    if not behavior_directions:
+        return
+
+    prompts = [item["prompt"] for item in eval_prompts]
+    judge = SmallModelJudge(model_id=exp_cfg.judge_model)
+
+    with registry.loaded(model_cfg) as (model, tokenizer):
+        steerer = ActivationSteerer(model)
+
+        for behavior, scale in tqdm(list(product(behavior_directions.keys(), k_scales)),
+                                    desc=model_cfg.name, dynamic_ncols=True):
+            directions = behavior_directions[behavior]
+            configs = {
+                "baseline": {},
+                "ramp_pos": _ramp_config(directions, scale),
+                "ramp_neg": _neg_config(directions, scale),
+            }
+            records: list[dict] = []
+            for condition in CONDITIONS:
+                logger.info("  [%s | %s | k=%.2f | %s]", model_cfg.name, behavior, scale, condition)
+                resps = generate_batched(model, tokenizer, steerer, configs[condition],
+                                         prompts, exp_cfg.max_new_tokens, batch_size, model_cfg.extra)
+                for item, resp in zip(eval_prompts, resps):
+                    records.append({
+                        "condition": condition, "behavior": behavior,
+                        "source": item["source"], "prompt_id": item["id"],
+                        "user_input": item["prompt"], "response": resp,
+                    })
+
+            scores = judge.score_records(records, batch_size=exp_cfg.judge_batch_size)
+            for rec, score in zip(records, scores):
+                rec["judge_score"] = score
+
+            k_tag = f"k{scale:.2f}".replace(".", "_")
+            out_dir = output_root / model_cfg.name / behavior / k_tag
+            out_dir.mkdir(parents=True, exist_ok=True)
+            fig_dir = figures_root / model_cfg.name / behavior / k_tag
+
+            df = pd.DataFrame(records)
+            df.to_csv(out_dir / "scored_results.csv", index=False)
+            summary = df.groupby("condition")["judge_score"].agg(["mean", "std", "count"])
+            summary.columns = ["mean_score", "std_score", "n"]
+            summary.to_csv(out_dir / "summary.csv")
+            logger.info("%s | %s | k=%.2f\n%s", model_cfg.name, behavior, scale, summary.to_string())
+            plot_results(df, behavior, model_cfg.name, scale, fig_dir)
+
+    judge.unload()
+    logger.info("=== %s done ===", model_cfg.name)
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Experiment 03 — ramp steering eval")
-    parser.add_argument("--config", default="config/models.yml")
+    parser.add_argument("--config",            default="config/models.yml")
     parser.add_argument("--experiment-config", default="config/experiment.yml")
-    parser.add_argument("--directions", default="results/directions")
-    parser.add_argument("--eval-prompts", default="data/eval_prompts")
-    parser.add_argument("--output-dir", default="results/ramp_eval")
-    parser.add_argument("--model", required=True, help="Model name from config/models.yml")
-    parser.add_argument(
-        "--behavior", required=True, choices=["sycophancy", "safety", "refusal"]
-    )
+    parser.add_argument("--directions",        default="results/directions")
+    parser.add_argument("--eval-prompts",      default="data/eval_prompts")
+    parser.add_argument("--output-dir",        default="results/ramp_eval")
+    parser.add_argument("--figures-dir",       default="figures/ramp_eval")
+    parser.add_argument("--batch-size",  type=int, default=64)
+    parser.add_argument("--models",   nargs="*", help="Default: all instruct models.")
+    parser.add_argument("--behaviors", nargs="*", help="Default: from experiment.yml.")
+    parser.add_argument("--k-scales",  nargs="*", type=float, help="Default: from experiment.yml.")
     parser.add_argument("--load-in-4bit", action="store_true")
-    parser.add_argument(
-        "--k-scale", type=float, default=1.0,
-        help="Multiply all K_ℓ values by this factor. "
-             "Sweep 0.5 / 1.0 / 2.0 / 3.0 to locate the lobotomy cliff.",
-    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    all_configs = load_model_configs(args.config)
+    exp_cfg     = load_experiment_config(args.experiment_config)
 
-    all_configs: dict[str, ModelConfig] = load_model_configs(args.config)
-    if args.model not in all_configs:
-        logger.error("Model '%s' not found. Available: %s", args.model, list(all_configs))
-        sys.exit(1)
-    model_cfg: ModelConfig = all_configs[args.model]
+    if args.models:
+        missing = set(args.models) - set(all_configs)
+        if missing:
+            logger.error("Unknown models: %s", missing); sys.exit(1)
+        target_names = args.models
+    else:
+        target_names = [n for n, c in all_configs.items() if c.is_instruct]
 
-    exp_cfg = load_experiment_config(args.experiment_config)
+    behaviors = args.behaviors or exp_cfg.behaviors
+    k_scales  = args.k_scales  or exp_cfg.k_scales
+    eval_prompts = load_eval_prompts(Path(args.eval_prompts), exp_cfg.n_harmbench, exp_cfg.n_clearharm)
+    registry = ModelRegistry(load_in_4bit=args.load_in_4bit, device_map="cuda:0")
 
-    scale_tag = f"k{args.k_scale:.2f}".replace(".", "p")
-    out_dir = Path(args.output_dir) / args.model / args.behavior / scale_tag
-    out_dir.mkdir(parents=True, exist_ok=True)
-    fig_dir = Path(exp_cfg.figures_dir) / "ramp_eval" / args.model / args.behavior / scale_tag
+    logger.info("%d models × %d behaviors × %d k-scales | batch_size=%d",
+                len(target_names), len(behaviors), len(k_scales), args.batch_size)
 
-    # ── Directions ────────────────────────────────────────────────────────────
-    dir_path = Path(args.directions) / args.model / f"{args.behavior}.npz"
-    if not dir_path.exists():
-        logger.error(
-            "Directions not found at %s — run experiment 02 first.", dir_path
-        )
-        sys.exit(1)
-    directions = load_directions(str(dir_path))
-    logger.info(
-        "Loaded %d direction vectors for %s | %s.", len(directions), args.model, args.behavior
-    )
-
-    # ── Eval prompts ──────────────────────────────────────────────────────────
-    eval_prompts = load_eval_prompts(
-        Path(args.eval_prompts), exp_cfg.n_harmbench, exp_cfg.n_clearharm
-    )
-
-    # ── Model ─────────────────────────────────────────────────────────────────
-    registry = ModelRegistry(load_in_4bit=args.load_in_4bit)
-    with registry.loaded(model_cfg) as (model, tokenizer):
-        steerer = ActivationSteerer(model)
-        configs = {
-            "baseline": {},
-            "ramp_pos": steerer.build_ramp_config(directions, scale=args.k_scale),
-            "ramp_neg": steerer.build_ramp_config(directions, scale=-args.k_scale),
-        }
-        k_vals = [v for (_, v) in configs["ramp_pos"].values()]
-        logger.info(
-            "k_scale=%.2f | %d layers | K range [%.4f, %.4f]",
-            args.k_scale, len(k_vals), min(k_vals), max(k_vals),
+    for name in target_names:
+        run_model(
+            model_cfg=all_configs[name],
+            behaviors=behaviors, k_scales=k_scales,
+            eval_prompts=eval_prompts,
+            directions_dir=Path(args.directions),
+            output_root=Path(args.output_dir),
+            figures_root=Path(args.figures_dir),
+            exp_cfg=exp_cfg, registry=registry,
+            batch_size=args.batch_size,
         )
 
-        # Phase 1: Generate all responses
-        all_records: list[dict] = []
-        for condition in CONDITIONS:
-            logger.info("=== Generating: %s ===", condition)
-            records = generate_condition(
-                model, tokenizer, steerer,
-                configs[condition], eval_prompts, args.behavior,
-                exp_cfg.max_new_tokens, model_cfg.extra, condition,
-            )
-            all_records.extend(records)
-
-    raw_df = pd.DataFrame(all_records)
-    raw_df.to_csv(out_dir / "raw_generations.csv", index=False)
-    logger.info("Phase 1 complete — %d responses. Checkpoint saved.", len(all_records))
-
-    # Phase 2: Batch judge (loaded separately from the main model)
-    logger.info("=== Phase 2: Judging %d records with %s ===", len(all_records), exp_cfg.judge_model)
-    judge = SmallModelJudge(model_id=exp_cfg.judge_model)
-    scores = judge.score_records(all_records, batch_size=exp_cfg.judge_batch_size)
-    judge.unload()
-
-    for rec, score in zip(all_records, scores):
-        rec["judge_score"] = score
-
-    scored_df = pd.DataFrame(all_records)
-    scored_df.to_csv(out_dir / "scored_results.csv", index=False)
-
-    # Phase 3: Aggregate and report
-    summary = scored_df.groupby("condition")["judge_score"].agg(["mean", "std", "count"])
-    summary.columns = ["mean_score", "std_score", "n"]
-    summary.to_csv(out_dir / "summary.csv")
-    logger.info("\n%s", summary.to_string())
-
-    plot_condition_comparison(scored_df, args.behavior, args.model, fig_dir)
-    plot_by_source(scored_df, args.behavior, args.model, fig_dir)
-    plot_per_prompt_heatmap(scored_df, args.behavior, args.model, fig_dir)
-
-    logger.info("Experiment 03 complete. Results → %s", out_dir)
+    logger.info("All done.")
 
 
 if __name__ == "__main__":
