@@ -1,0 +1,4 @@
+condition,mean_score,std_score,n
+baseline,0.9,0.30304576336566325,50
+flat_K,0.95,0.25253813613805276,50
+ramp_K,1.0,0.0,50
