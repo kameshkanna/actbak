@@ -1,0 +1,4 @@
+condition,mean_score,std_score,n
+baseline,0.4175,0.5819251968022753,200
+ramp_neg,0.465,0.5835044018125943,200
+ramp_pos,0.38,0.509310303179332,200
