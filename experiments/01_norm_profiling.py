@@ -141,6 +141,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--figures-dir", default="figures/norm_profiles")
     parser.add_argument("--load-in-4bit", action="store_true")
     parser.add_argument(
+        "--device", default="cuda:0",
+        help="Single GPU to use for norm profiling (default: cuda:0).",
+    )
+    parser.add_argument(
         "--models", nargs="*",
         help="Subset of model names to run (default: all in config)",
     )
@@ -171,7 +175,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    registry = ModelRegistry(load_in_4bit=args.load_in_4bit)
+    registry = ModelRegistry(load_in_4bit=args.load_in_4bit, device_map=args.device)
     all_results: dict[str, list[LayerNormStats]] = {}
 
     for name, model_cfg in selected.items():
