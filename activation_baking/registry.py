@@ -96,8 +96,7 @@ class ModelRegistry:
         if key in self._cache:
             del self._cache[key]
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            self._clear_cuda_cache()
             logger.info("Released %s from registry.", model_cfg.name)
 
     def release_all(self) -> None:
@@ -106,9 +105,16 @@ class ModelRegistry:
         for key in keys:
             del self._cache[key]
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self._clear_cuda_cache()
         logger.info("Registry cleared (%d models released).", len(keys))
+
+    @staticmethod
+    def _clear_cuda_cache() -> None:
+        """Empty the CUDA allocator cache on every visible device."""
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                with torch.cuda.device(i):
+                    torch.cuda.empty_cache()
 
     @contextmanager
     def loaded(

@@ -92,9 +92,31 @@ class NormProfiler:
         self._hidden_size: int = model_cfg.hidden_size
         self._num_layers: int = model_cfg.num_layers
         self._max_length = max_length
-        self._device: torch.device = next(model.parameters()).device
+        self._device: torch.device = self._resolve_input_device(model)
         self._hooks: list[torch.utils.hooks.RemovableHook] = []
         self._layer_norms: dict[int, list[float]] = defaultdict(list)
+
+    @staticmethod
+    def _resolve_input_device(model: PreTrainedModel) -> torch.device:
+        """Return the device where input tokens should be placed.
+
+        With device_map='auto' the embedding layer lands on the first device in
+        hf_device_map.  Falling back to next(model.parameters()).device works
+        for single-GPU and CPU models.
+        """
+        hf_map: dict | None = getattr(model, "hf_device_map", None)
+        if hf_map:
+            embed_device: str = hf_map.get("model.embed_tokens") or next(iter(hf_map.values()))
+            return torch.device(embed_device) if embed_device != "cpu" else torch.device("cpu")
+        return next(model.parameters()).device
+
+    @staticmethod
+    def _clear_cuda_cache() -> None:
+        """Empty the CUDA allocator cache on every visible device."""
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                with torch.cuda.device(i):
+                    torch.cuda.empty_cache()
 
     def _make_hook(self, layer_idx: int) -> Callable:
         """Return a forward hook that records mean sequence-level L2 norms.
@@ -171,8 +193,7 @@ class NormProfiler:
                 with torch.no_grad():
                     self._model(**inputs)
 
-                if self._device.type == "cuda":
-                    torch.cuda.empty_cache()
+                self._clear_cuda_cache()
         finally:
             self._remove_hooks()
 
