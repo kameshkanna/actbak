@@ -117,7 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--norm-profiles", default="results/norm_profiles")
     parser.add_argument("--output-dir", default="results/directions")
     parser.add_argument(
-        "--behaviors", nargs="*", default=["sycophancy", "safety", "refusal"]
+        "--behaviors", nargs="*", default=["safety", "sycophancy"]
     )
     parser.add_argument("--models", nargs="*")
     parser.add_argument("--load-in-4bit", action="store_true")
