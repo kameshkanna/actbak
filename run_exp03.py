@@ -1,13 +1,22 @@
-"""Experiment 03 runner — one model load per model, batched generation, single GPU.
+"""Experiment 03 runner — optimised for GH200 (96 GB HBM3e).
+
+GH200 specifics
+---------------
+- 96 GB VRAM: main model (~16 GB) + judge (~6 GB) both stay loaded simultaneously.
+  No unload/reload cycle between generation and scoring.
+- batch_size=64 default — fits comfortably with ~22 GB for both models + KV cache.
+- bfloat16 + SDPA + tf32 matmul for H100 tensor-core throughput.
+- expandable_segments allocator to avoid fragmentation across many batches.
 
 For each model:
-  1. Load once on a single GPU.
-  2. Run all behavior × k-scale × condition combos while the model is loaded.
-  3. Unload model, score with judge, save results.
+  1. Load main model + judge simultaneously.
+  2. Run all behavior × k-scale × condition combos (batched) while both are loaded.
+  3. Score inline after each combo — no waiting to unload.
+  4. Unload main model, move to next.
 
 Usage:
     python run_exp03.py                         # all instruct models, all scales
-    python run_exp03.py --batch-size 16         # tune to GPU VRAM
+    python run_exp03.py --batch-size 128        # push harder on GH200
     python run_exp03.py --models llama-3.1-8b-instruct --behaviors safety
 """
 
@@ -16,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from itertools import product
 from pathlib import Path
@@ -27,6 +37,11 @@ import numpy as np
 import pandas as pd
 import torch
 from tqdm import tqdm
+
+# GH200 / H100 tensor-core and allocator settings
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 from activation_baking.config import ModelConfig, load_experiment_config, load_model_configs
 from activation_baking.direction_extractor import load_directions
@@ -185,6 +200,9 @@ def run_model(
     prompts = [item["prompt"] for item in eval_prompts]
     all_records: dict[tuple[str, float], list[dict]] = {}
 
+    # GH200: 96 GB — load judge alongside main model, no unload/reload cycle.
+    judge = SmallModelJudge(model_id=exp_cfg.judge_model)
+
     with registry.loaded(model_cfg) as (model, tokenizer):
         steerer = ActivationSteerer(model)
         combos = list(product(behavior_directions.keys(), k_scales))
@@ -207,30 +225,26 @@ def run_model(
                         "source": item["source"], "prompt_id": item["id"],
                         "user_input": item["prompt"], "response": resp,
                     })
-            all_records[(behavior, scale)] = records
 
-    logger.info("Judging all responses for %s...", model_cfg.name)
-    judge = SmallModelJudge(model_id=exp_cfg.judge_model)
+            # Score inline — judge is already loaded, no memory swap needed.
+            scores = judge.score_records(records, batch_size=exp_cfg.judge_batch_size)
+            for rec, score in zip(records, scores):
+                rec["judge_score"] = score
 
-    for (behavior, scale), records in all_records.items():
-        scores = judge.score_records(records, batch_size=exp_cfg.judge_batch_size)
-        for rec, score in zip(records, scores):
-            rec["judge_score"] = score
+            k_tag = f"k{scale:.2f}".replace(".", "_")
+            out_dir = output_root / model_cfg.name / behavior / k_tag
+            out_dir.mkdir(parents=True, exist_ok=True)
+            fig_dir = figures_root / model_cfg.name / behavior / k_tag
 
-        k_tag = f"k{scale:.2f}".replace(".", "_")
-        out_dir = output_root / model_cfg.name / behavior / k_tag
-        out_dir.mkdir(parents=True, exist_ok=True)
-        fig_dir = figures_root / model_cfg.name / behavior / k_tag
+            df = pd.DataFrame(records)
+            df.to_csv(out_dir / "scored_results.csv", index=False)
 
-        df = pd.DataFrame(records)
-        df.to_csv(out_dir / "scored_results.csv", index=False)
+            summary = df.groupby("condition")["judge_score"].agg(["mean", "std", "count"])
+            summary.columns = ["mean_score", "std_score", "n"]
+            summary.to_csv(out_dir / "summary.csv")
+            logger.info("%s | %s | k=%.2f\n%s", model_cfg.name, behavior, scale, summary.to_string())
 
-        summary = df.groupby("condition")["judge_score"].agg(["mean", "std", "count"])
-        summary.columns = ["mean_score", "std_score", "n"]
-        summary.to_csv(out_dir / "summary.csv")
-        logger.info("%s | %s | k=%.2f\n%s", model_cfg.name, behavior, scale, summary.to_string())
-
-        plot_results(df, behavior, model_cfg.name, scale, fig_dir)
+            plot_results(df, behavior, model_cfg.name, scale, fig_dir)
 
     judge.unload()
     logger.info("=== %s done ===", model_cfg.name)
@@ -248,7 +262,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-prompts",      default="data/eval_prompts")
     parser.add_argument("--output-dir",        default="results/ramp_eval")
     parser.add_argument("--figures-dir",       default="figures/ramp_eval")
-    parser.add_argument("--batch-size",  type=int, default=8)
+    parser.add_argument("--batch-size",  type=int, default=64,
+                        help="Prompts per generation batch. GH200 default: 64.")
     parser.add_argument("--models",   nargs="*")
     parser.add_argument("--behaviors", nargs="*")
     parser.add_argument("--k-scales",  nargs="*", type=float)
