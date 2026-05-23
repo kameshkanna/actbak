@@ -6,6 +6,7 @@ experiment:
   # Behavioral axes
   behaviors:
     - safety
+    - sycophancy
 
   # K multipliers for the ramp magnitude sweep
   k_scales: [0.25, 0.5, 1.0, 2.0, 3.0, 5.0]
@@ -17,12 +18,21 @@ experiment:
   judge_model: Qwen/Qwen2.5-3B-Instruct
   judge_batch_size: 8
 
-  # Evaluation sample counts (capped at 500 for now)
+  # Evaluation sample counts
   n_harmbench:   200
   n_clearharm:   200
+  n_sycophancy:  200
   n_gsm8k:       500
   n_mmlu:        500
   n_truthfulqa:  500
+
+  # Ablation settings
+  ablation_n_prompts:    50    # HarmBench prompts for norm calibration ablation
+  ablation_k_scales:     [0.1, 1.0, 10.0]
+  ablation_layer_fracs:  [0.4, 0.5, 0.6, 0.7, 0.8]
+  reconstruction_k_scale: 20.0
+  reconstruction_n_prompts: 10
+  reconstruction_layer_fracs: [0.4, 0.5]
 
   # Reproducibility
   seed: 42

@@ -77,33 +77,45 @@ class ExperimentConfig:
     """Runtime parameters shared across all experiment scripts.
 
     Attributes:
-        behaviors:          Behavioral axes to evaluate.
-        k_scales:           K multipliers for the sweep ablation.
-        max_new_tokens:     Token budget for model generation.
-        judge_model:        HuggingFace id of the SmallModelJudge.
-        judge_batch_size:   Prompts per judge forward pass.
-        n_harmbench:        HarmBench samples per eval run.
-        n_clearharm:        ClearHarm samples per eval run.
-        n_advbench:         AdvBench samples per eval run.
-        n_truthfulqa:       TruthfulQA samples per eval run.
-        n_gsm8k:            GSM8K samples for capability check.
-        n_mmlu:             MMLU samples for capability check.
-        seed:               Global random seed for reproducibility.
-        results_dir:        Root directory for CSV / npz outputs.
-        figures_dir:        Root directory for PDF / PNG plots.
+        behaviors:                  Behavioral axes to evaluate.
+        k_scales:                   K multipliers for the ramp sweep.
+        max_new_tokens:             Token budget for model generation.
+        judge_model:                HuggingFace id of the SmallModelJudge.
+        judge_batch_size:           Prompts per judge forward pass.
+        n_harmbench:                HarmBench samples for safety eval.
+        n_clearharm:                ClearHarm samples for safety eval.
+        n_sycophancy:               Anthropic sycophancy eval samples.
+        n_gsm8k:                    GSM8K samples for capability check.
+        n_mmlu:                     MMLU samples for capability check.
+        n_truthfulqa:               TruthfulQA samples for capability check.
+        ablation_n_prompts:         HarmBench prompts for norm calibration ablation.
+        ablation_k_scales:          K scale multipliers for norm calibration ablation.
+        ablation_layer_fracs:       Layer depth fractions for norm calibration (40–80%).
+        reconstruction_k_scale:     K multiplier for reconstruction capacity ablation.
+        reconstruction_n_prompts:   Prompt count for reconstruction capacity ablation.
+        reconstruction_layer_fracs: Layer depth fractions for reconstruction ablation.
+        seed:                       Global random seed for reproducibility.
+        results_dir:                Root directory for CSV / npz outputs.
+        figures_dir:                Root directory for PDF / PNG plots.
     """
 
-    behaviors: list[str] = field(default_factory=lambda: ["safety", "refusal", "sycophancy"])
-    k_scales: list[float] = field(default_factory=lambda: [0.0, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0])
+    behaviors: list[str] = field(default_factory=lambda: ["safety", "sycophancy"])
+    k_scales: list[float] = field(default_factory=lambda: [0.25, 0.5, 1.0, 2.0, 3.0, 5.0])
     max_new_tokens: int = 150
     judge_model: str = "Qwen/Qwen2.5-3B-Instruct"
     judge_batch_size: int = 8
-    n_harmbench: int = 50
-    n_clearharm: int = 50
-    n_advbench: int = 50
-    n_truthfulqa: int = 50
-    n_gsm8k: int = 100
-    n_mmlu: int = 100
+    n_harmbench: int = 200
+    n_clearharm: int = 200
+    n_sycophancy: int = 200
+    n_gsm8k: int = 500
+    n_mmlu: int = 500
+    n_truthfulqa: int = 500
+    ablation_n_prompts: int = 50
+    ablation_k_scales: list[float] = field(default_factory=lambda: [0.1, 1.0, 10.0])
+    ablation_layer_fracs: list[float] = field(default_factory=lambda: [0.4, 0.5, 0.6, 0.7, 0.8])
+    reconstruction_k_scale: float = 20.0
+    reconstruction_n_prompts: int = 10
+    reconstruction_layer_fracs: list[float] = field(default_factory=lambda: [0.4, 0.5])
     seed: int = 42
     results_dir: str = "results"
     figures_dir: str = "figures"

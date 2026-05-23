@@ -1,21 +1,21 @@
 # Activation Baking
 
-**Ramp-calibrated behavioral steering that fights growing residual stream norms — and a weight-space formulation that makes it permanent.**
+**Ramp-calibrated behavioral steering that compensates for growing residual stream norms.**
 
 ---
 
 ## The Problem with Flat-K Steering
 
-Activation steering adds a vector to the residual stream at layer ℓ:
+Activation steering adds a direction vector to the residual stream at layer ℓ:
 
 ```
 h_ℓ  →  h_ℓ + K · ĉ
 ```
 
-Prior work uses a fixed K across all layers. This breaks down because residual stream norms grow monotonically with depth — by ×84 in Llama-3.1-8B. A flat K calibrated for shallow layers gets drowned out at deep layers where ‖h_ℓ‖ is large.
+Prior work uses a fixed K across all layers. This fails because residual stream norms grow monotonically with depth — by ×84 in Llama-3.1-8B. A flat K calibrated for shallow layers is drowned out at deep layers:
 
 ```
-relative influence  =  K / ‖h_ℓ‖   →  0   as layer depth increases
+relative influence  =  K / ‖h_ℓ‖   →  0   as depth increases
 ```
 
 ---
@@ -54,23 +54,22 @@ bash setup.sh
 source .venv/bin/activate
 ```
 
-Requires Python ≥ 3.10 and a CUDA GPU. Each 8B model fits on a single 40 GB A100 in bfloat16.
+Requires Python ≥ 3.10 and a CUDA GPU. Each 8B model fits on a single 40 GB A100 in bfloat16; optimised for GH200 (96 GB) with `batch_size=64`.
 
 ---
 
 ## Datasets
 
 ```bash
-# Download all datasets
 python data/download_datasets.py
 ```
 
-| Dataset | Used by |
-|---|---|
-| MT-Bench (80 prompts) | Exp 01 — norm profiling |
-| HarmBench behaviors | Exp 03 — steering eval |
-| ClearHarm | Exp 03 — steering eval |
-| GSM8K / MMLU / TruthfulQA | Capability benchmarks (cached) |
+| Dataset | Behavior | Used by |
+|---|---|---|
+| MT-Bench (80 prompts) | — | Exp 01 — norm profiling |
+| HarmBench behaviors | Safety | Exp 03, Ablation 01, Ablation 02 |
+| ClearHarm | Safety | Exp 03 |
+| Anthropic model-written-evals (sycophancy) | Sycophancy | Exp 03 |
 
 ---
 
@@ -102,7 +101,12 @@ python experiments/02_direction_extraction.py
 
 ### Step 3 — Ramp Steering Evaluation
 
-Evaluates ramp-K steering across all model families and behaviors. Three conditions: `baseline`, `ramp_pos`, `ramp_neg`. Sweeps K scales to locate the lobotomy cliff.
+Evaluates ramp-K steering across all model families and behaviors.
+
+- **Safety** (HarmBench + ClearHarm): scored SAFE / UNSAFE / GIBBERISH
+- **Sycophancy** (Anthropic evals): scored SYCOPHANTIC / CONSISTENT / GIBBERISH
+
+Three conditions per (behavior, k_scale): `baseline` (once per behavior), `ramp_pos`, `ramp_neg`.
 
 ```bash
 python experiments/03_ramp_steering_eval.py
@@ -111,16 +115,16 @@ python experiments/03_ramp_steering_eval.py
 Flags:
 
 ```bash
-python experiments/03_ramp_steering_eval.py --batch-size 16                          # tune to GPU VRAM
-python experiments/03_ramp_steering_eval.py --models llama-3.1-8b-instruct           # single model
-python experiments/03_ramp_steering_eval.py --behaviors safety --k-scales 0.5 1.0    # subset
+python experiments/03_ramp_steering_eval.py --batch-size 16          # tune to VRAM
+python experiments/03_ramp_steering_eval.py --models llama-3.1-8b-instruct
+python experiments/03_ramp_steering_eval.py --behaviors safety --k-scales 0.5 1.0
 ```
 
-**Outputs:** `results/ramp_eval/{model}/{behavior}/k{scale}/scored_results.csv`, `figures/`
+**Outputs:** `results/ramp_eval/{model}/{behavior}/{baseline,k{scale}}/scored_results.csv`
 
 ---
 
-### Full pipeline
+### Full Pipeline
 
 ```bash
 bash setup.sh && source .venv/bin/activate
@@ -134,6 +138,40 @@ python experiments/03_ramp_steering_eval.py
 
 ---
 
+## Ablations
+
+### Ablation 01 — Norm Calibration
+
+Demonstrates that K_ℓ is the correct operating point by steering a single layer at a time with K values spanning three orders of magnitude relative to ‖h_ℓ‖.
+
+| K | Meaning | Expected outcome |
+|---|---|---|
+| 0.1 × K_ℓ | Well below norm | Near-baseline score, weak steering |
+| 1.0 × K_ℓ | Formula value | Effective steering, coherent output |
+| 10.0 × K_ℓ | Far above norm | Residual stream blown out, gibberish |
+
+Targets layers at 40%, 50%, 60%, 70%, 80% depth — where concepts form.
+
+```bash
+python ablations/01_norm_calibration.py
+```
+
+**Outputs:** `results/ablations/norm_calibration/{model}/`, `figures/ablations/norm_calibration/`
+
+---
+
+### Ablation 02 — Early-Middle Layer Reconstruction Capacity
+
+When a model is steered heavily (K = 20× K_ℓ) at an early-middle layer (40–50% depth), can subsequent layers reconstruct a coherent output? This probes the model's implicit error-correction capacity.
+
+```bash
+python ablations/02_reconstruction_capacity.py
+```
+
+**Outputs:** `results/ablations/reconstruction/{model}/layer_{pct}pct.jsonl`, `summary.txt`
+
+---
+
 ## Project Structure
 
 ```
@@ -143,29 +181,28 @@ activation_baking/
   model_utils.py         Model loading, prompt formatting, generation
   norm_profiler.py       Hook-based residual stream norm measurement
   direction_extractor.py Contrastive activation direction extraction (CAA)
-  steerer.py             Inference-time ramp steering
-  baker.py               Weight-space baking — writes K_ℓ·ĉ into W_down.bias
-  judges.py              SmallModelJudge (SAFE/UNSAFE/GIBBERISH)
+  steerer.py             Inference-time ramp steering + config builders
+  judges.py              SmallModelJudge (behavior-aware: safety + sycophancy)
 
 config/
   models.yml             8 model variants (4 instruct + 4 base)
-  experiment.yml         Hyperparameters and sample counts
+  experiment.yml         Hyperparameters, sample counts, ablation settings
 
 data/
-  contrastive_pairs/     CAA minimal pairs (safety, refusal, sycophancy)
+  contrastive_pairs/     CAA minimal pairs (safety, sycophancy)
   download_datasets.py   Downloads all required datasets
 
 experiments/
   01_norm_profiling.py       Measure norm growth, derive K_ℓ schedule
   02_direction_extraction.py Extract behavioral directions via CAA
-  03_ramp_steering_eval.py   Ramp steering — all models, behaviors, scales
+  03_ramp_steering_eval.py   Ramp steering — all models, behaviors, K scales
+
+ablations/
+  01_norm_calibration.py     Single-layer K ablation at 40–80% depth
+  02_reconstruction_capacity.py  Early-middle heavy steering + recovery analysis
 
 paper/
   formula_derivation.md  K_ℓ = μ̄_ℓ / √d derivation
-
-run_exp01.py   Parallel norm profiling — one model per GPU
-run_exp02.py   Parallel direction extraction — one model per GPU
-run_exp03.py   Batched ramp eval — one model load, all scales
 ```
 
 ---

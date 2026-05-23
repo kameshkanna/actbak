@@ -7,36 +7,26 @@ Dataset inventory
 
   harmbench_eval   HarmBench standard behaviors (from GitHub CSV)
                    →  data/eval_prompts/harmbench.jsonl
-                   Used by: experiment 03 (ramp steering eval)
+                   Used by: experiment 03 (safety eval), ablation 01
 
   clearharm_eval   ClearHarm (AlignmentResearch/ClearHarm, HuggingFace)
                    →  data/eval_prompts/clearharm.jsonl
-                   Used by: experiment 03 (ramp steering eval)
+                   Used by: experiment 03 (safety eval)
+
+  sycophancy_eval  Anthropic model-written sycophancy evals (HuggingFace)
+                   →  data/eval_prompts/sycophancy.jsonl
+                   Used by: experiment 03 (sycophancy eval)
 
   gsm8k            GSM8K test set (HuggingFace cache)
-                   Used by: experiment 04 (baking eval — GSM8KEvaluator)
-
   mmlu             MMLU all/test (HuggingFace cache)
-                   Used by: experiment 04 (baking eval — MMLUEvaluator)
-
   truthfulqa       TruthfulQA multiple_choice/validation (HuggingFace cache)
-                   Used by: experiment 04 (baking eval — TruthfulQAEvaluator)
-
-Sample counts for the JSONL files are read from config/experiment.yml by default
-and can be overridden per-dataset.
 
 Usage:
-    # Download everything (reads counts from config/experiment.yml)
     python data/download_datasets.py
 
-    # Override sample counts
-    python data/download_datasets.py --n-harmbench 100 --n-clearharm 100
+    python data/download_datasets.py --n-harmbench 100 --n-clearharm 100 --n-sycophancy 100
 
-    # Selective download
-    python data/download_datasets.py --only mtbench harmbench_eval clearharm_eval
-
-    # Skip HuggingFace dataset caching (download only local JSONL files)
-    python data/download_datasets.py --skip-hf-cache
+    python data/download_datasets.py --only mtbench harmbench_eval clearharm_eval sycophancy_eval
 """
 
 from __future__ import annotations
@@ -62,7 +52,6 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-REPO_ROOT = Path(__file__).parent.parent
 DATA_DIR = Path(__file__).parent
 EVAL_PROMPTS_DIR = DATA_DIR / "eval_prompts"
 
@@ -75,10 +64,19 @@ HARMBENCH_CSV_URL = (
     "main/data/behavior_datasets/harmbench_behaviors_text_all.csv"
 )
 
+# Anthropic model-written-evals — NLP survey sycophancy (most diverse subset)
+ANTHROPIC_SYCO_FILES = [
+    "sycophancy/sycophancy_on_nlp_survey.jsonl",
+    "sycophancy/sycophancy_on_philpapers_survey.jsonl",
+    "sycophancy/sycophancy_on_political_typology_quiz.jsonl",
+]
+ANTHROPIC_SYCO_HF_REPO = "Anthropic/model-written-evals"
+
 ALL_DATASETS = [
     "mtbench",
     "harmbench_eval",
     "clearharm_eval",
+    "sycophancy_eval",
     "gsm8k",
     "mmlu",
     "truthfulqa",
@@ -91,10 +89,11 @@ ALL_DATASETS = [
 
 
 def load_counts(config_path: Path) -> dict[str, int]:
-    """Read sample counts from experiment.yml, falling back to defaults."""
-    defaults = {
-        "n_harmbench": 50,
-        "n_clearharm": 50,
+    """Read sample counts from experiment.yml, falling back to hard-coded defaults."""
+    defaults: dict[str, int] = {
+        "n_harmbench": 200,
+        "n_clearharm": 200,
+        "n_sycophancy": 200,
         "seed": 42,
     }
     if not config_path.exists():
@@ -105,9 +104,10 @@ def load_counts(config_path: Path) -> dict[str, int]:
         raw = yaml.safe_load(f)
     exp = raw.get("experiment", {})
     return {
-        "n_harmbench": exp.get("n_harmbench", defaults["n_harmbench"]),
-        "n_clearharm": exp.get("n_clearharm", defaults["n_clearharm"]),
-        "seed": exp.get("seed", defaults["seed"]),
+        "n_harmbench":  exp.get("n_harmbench",  defaults["n_harmbench"]),
+        "n_clearharm":  exp.get("n_clearharm",  defaults["n_clearharm"]),
+        "n_sycophancy": exp.get("n_sycophancy", defaults["n_sycophancy"]),
+        "seed":         exp.get("seed",         defaults["seed"]),
     }
 
 
@@ -122,7 +122,7 @@ def download_mtbench(output: Path = DATA_DIR / "mtbench_questions.jsonl") -> Non
         logger.info("MT-Bench already at %s — skipping.", output)
         return
 
-    logger.info("Downloading MT-Bench questions from FastChat...")
+    logger.info("Downloading MT-Bench questions...")
     resp = requests.get(MTBENCH_URL, timeout=30)
     resp.raise_for_status()
 
@@ -142,12 +142,22 @@ def download_mtbench(output: Path = DATA_DIR / "mtbench_questions.jsonl") -> Non
 
 
 # ---------------------------------------------------------------------------
-# HarmBench (local JSONL for experiment 03)
+# HarmBench
 # ---------------------------------------------------------------------------
 
 
 def download_harmbench_eval(n: int, seed: int) -> list[dict]:
-    """Fetch HarmBench standard behaviors CSV from GitHub, sample n rows."""
+    """Fetch HarmBench standard behaviors CSV from GitHub and sample n rows.
+
+    Args:
+        n:    Number of prompts to sample.
+        seed: Random seed for reproducible sampling.
+
+    Returns:
+        List of dicts with keys ``source``, ``id``, ``prompt``, ``category``.
+    """
+    if n <= 0:
+        raise ValueError(f"n must be > 0, got {n}")
     logger.info("Downloading HarmBench behaviors CSV...")
     resp = requests.get(HARMBENCH_CSV_URL, timeout=30)
     resp.raise_for_status()
@@ -170,8 +180,7 @@ def download_harmbench_eval(n: int, seed: int) -> list[dict]:
         parts = line.split(",", len(header) - 1)
         if len(parts) < len(header):
             continue
-        func_cat = parts[func_idx].strip().strip('"')
-        if func_cat != "standard":
+        if parts[func_idx].strip().strip('"') != "standard":
             continue
         rows.append({
             "source":   "harmbench",
@@ -187,17 +196,27 @@ def download_harmbench_eval(n: int, seed: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# ClearHarm (local JSONL for experiment 03)
+# ClearHarm
 # ---------------------------------------------------------------------------
 
 
 def download_clearharm_eval(n: int, seed: int) -> list[dict]:
-    """Load ClearHarm from HuggingFace, sample n records."""
-    logger.info("Loading ClearHarm from HuggingFace (AlignmentResearch/ClearHarm)...")
+    """Load ClearHarm from HuggingFace and sample n records.
+
+    Args:
+        n:    Number of prompts to sample.
+        seed: Random seed for reproducible sampling.
+
+    Returns:
+        List of dicts with keys ``source``, ``id``, ``prompt``.
+    """
+    if n <= 0:
+        raise ValueError(f"n must be > 0, got {n}")
+    logger.info("Loading ClearHarm (AlignmentResearch/ClearHarm)...")
     try:
         from datasets import load_dataset  # type: ignore[import-untyped]
         ds = load_dataset("AlignmentResearch/ClearHarm", split="train")
-    except Exception as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         raise RuntimeError(f"Failed to load ClearHarm: {exc}") from exc
 
     rows: list[dict] = []
@@ -220,15 +239,95 @@ def download_clearharm_eval(n: int, seed: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# HuggingFace dataset pre-caching (experiment 04 evaluators)
+# Sycophancy (Anthropic model-written-evals)
 # ---------------------------------------------------------------------------
 
 
-def _cache_hf_dataset(path: str, name: str, split: str, label: str) -> None:
+def download_sycophancy_eval(n: int, seed: int) -> list[dict]:
+    """Load Anthropic model-written sycophancy evals from HuggingFace and sample n records.
+
+    Pulls from three sycophancy sub-files (NLP survey, PhilPapers survey,
+    political typology quiz), merges them, then samples n uniformly.
+
+    Each output record contains:
+        source               always ``"anthropic_syco"``
+        id                   unique identifier
+        prompt               the user question (includes the user's stated view)
+        sycophantic_answer   what a sycophantic model would say
+        honest_answer        what an honest model would say
+
+    The ``sycophantic_answer`` / ``honest_answer`` fields are passed to the
+    judge so it can make well-anchored binary decisions without free-form rubric
+    interpretation.
+
+    Args:
+        n:    Number of prompts to sample.
+        seed: Random seed for reproducible sampling.
+
+    Returns:
+        List of dicts with keys described above.
+
+    Raises:
+        RuntimeError: If the HuggingFace dataset cannot be loaded.
+    """
+    if n <= 0:
+        raise ValueError(f"n must be > 0, got {n}")
+    logger.info("Loading Anthropic model-written sycophancy evals from HuggingFace...")
+    try:
+        from datasets import load_dataset  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise RuntimeError("datasets package not installed. Run: pip install datasets") from exc
+
+    rows: list[dict] = []
+    for file_path in ANTHROPIC_SYCO_FILES:
+        try:
+            ds = load_dataset(
+                ANTHROPIC_SYCO_HF_REPO,
+                data_files={"train": file_path},
+                split="train",
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            logger.warning("Could not load %s: %s — skipping.", file_path, exc)
+            continue
+
+        stem = Path(file_path).stem
+        for i, ex in enumerate(ds):
+            question = ex.get("question", "").strip()
+            if not question:
+                continue
+            rows.append({
+                "source":             "anthropic_syco",
+                "id":                 f"{stem}_{i}",
+                "prompt":             question,
+                "sycophantic_answer": ex.get("answer_matching_behavior", "").strip(),
+                "honest_answer":      ex.get("answer_not_matching_behavior", "").strip(),
+            })
+
+    if not rows:
+        raise RuntimeError(
+            "No sycophancy records loaded. "
+            f"Check that '{ANTHROPIC_SYCO_HF_REPO}' is accessible on HuggingFace."
+        )
+
+    rng = random.Random(seed)
+    sampled = rng.sample(rows, min(n, len(rows)))
+    logger.info(
+        "Sycophancy eval: %d records across %d files → sampled %d",
+        len(rows), len(ANTHROPIC_SYCO_FILES), len(sampled),
+    )
+    return sampled
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace dataset pre-caching
+# ---------------------------------------------------------------------------
+
+
+def _cache_hf_dataset(path: str, name: str | None, split: str, label: str) -> None:
     """Load a HuggingFace dataset once to populate the local cache."""
     try:
         from datasets import load_dataset  # type: ignore[import-untyped]
-        logger.info("Pre-caching %s (%s/%s)...", label, name, split)
+        logger.info("Pre-caching %s (%s / %s)...", label, path, split)
         ds = load_dataset(path, name, split=split)
         logger.info("%s: %d examples cached.", label, len(ds))
     except Exception as exc:
@@ -281,29 +380,17 @@ def parse_args() -> argparse.Namespace:
         "--config", default="config/experiment.yml",
         help="Path to experiment.yml; used to read default sample counts.",
     )
-    parser.add_argument(
-        "--n-harmbench", type=int, default=None,
-        help="HarmBench samples for eval_prompts JSONL (overrides config).",
-    )
-    parser.add_argument(
-        "--n-clearharm", type=int, default=None,
-        help="ClearHarm samples for eval_prompts JSONL (overrides config).",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=None,
-        help="Random seed for sampling (overrides config).",
-    )
+    parser.add_argument("--n-harmbench",  type=int, default=None)
+    parser.add_argument("--n-clearharm",  type=int, default=None)
+    parser.add_argument("--n-sycophancy", type=int, default=None)
+    parser.add_argument("--seed",         type=int, default=None)
     parser.add_argument(
         "--only", nargs="+", choices=ALL_DATASETS, metavar="DATASET",
-        help=(
-            f"Download only specified dataset(s). Choices: {ALL_DATASETS}. "
-            "Default: all."
-        ),
+        help=f"Download only specified dataset(s). Choices: {ALL_DATASETS}. Default: all.",
     )
     parser.add_argument(
         "--skip-hf-cache", action="store_true",
-        help="Skip pre-caching HuggingFace datasets (gsm8k, mmlu, truthfulqa, harmbench_hf). "
-             "They will be downloaded automatically the first time an evaluator runs.",
+        help="Skip pre-caching gsm8k/mmlu/truthfulqa. They download lazily on first eval.",
     )
     parser.add_argument(
         "--force", action="store_true",
@@ -321,51 +408,51 @@ def main() -> None:
     args = parse_args()
 
     counts = load_counts(Path(args.config))
-    n_harmbench = args.n_harmbench if args.n_harmbench is not None else counts["n_harmbench"]
-    n_clearharm = args.n_clearharm if args.n_clearharm is not None else counts["n_clearharm"]
-    seed        = args.seed        if args.seed        is not None else counts["seed"]
+    n_harmbench  = args.n_harmbench  if args.n_harmbench  is not None else counts["n_harmbench"]
+    n_clearharm  = args.n_clearharm  if args.n_clearharm  is not None else counts["n_clearharm"]
+    n_sycophancy = args.n_sycophancy if args.n_sycophancy is not None else counts["n_sycophancy"]
+    seed         = args.seed         if args.seed         is not None else counts["seed"]
 
     targets: set[str] = set(args.only) if args.only else set(ALL_DATASETS)
     if args.skip_hf_cache:
-        targets -= {"gsm8k", "mmlu", "truthfulqa", "harmbench_hf"}
+        targets -= {"gsm8k", "mmlu", "truthfulqa"}
 
     logger.info(
-        "Datasets to download: %s  |  n_harmbench=%d  n_clearharm=%d  seed=%d",
-        sorted(targets), n_harmbench, n_clearharm, seed,
+        "Datasets: %s  |  n_harmbench=%d  n_clearharm=%d  n_sycophancy=%d  seed=%d",
+        sorted(targets), n_harmbench, n_clearharm, n_sycophancy, seed,
     )
 
-    # ── MT-Bench ──────────────────────────────────────────────────────────────
     if "mtbench" in targets:
         out = DATA_DIR / "mtbench_questions.jsonl"
         if args.force and out.exists():
             out.unlink()
         download_mtbench(out)
 
-    # ── HarmBench JSONL (experiment 03) ───────────────────────────────────────
     if "harmbench_eval" in targets:
         out = EVAL_PROMPTS_DIR / "harmbench.jsonl"
         if args.force and out.exists():
             out.unlink()
         if not _already_exists(out, "HarmBench eval prompts"):
-            records = download_harmbench_eval(n_harmbench, seed)
-            _save_jsonl(records, out)
+            _save_jsonl(download_harmbench_eval(n_harmbench, seed), out)
 
-    # ── ClearHarm JSONL (experiment 03) ───────────────────────────────────────
     if "clearharm_eval" in targets:
         out = EVAL_PROMPTS_DIR / "clearharm.jsonl"
         if args.force and out.exists():
             out.unlink()
         if not _already_exists(out, "ClearHarm eval prompts"):
-            records = download_clearharm_eval(n_clearharm, seed)
-            _save_jsonl(records, out)
+            _save_jsonl(download_clearharm_eval(n_clearharm, seed), out)
 
-    # ── HuggingFace cache (experiment 04 evaluators) ─────────────────────────
+    if "sycophancy_eval" in targets:
+        out = EVAL_PROMPTS_DIR / "sycophancy.jsonl"
+        if args.force and out.exists():
+            out.unlink()
+        if not _already_exists(out, "Sycophancy eval prompts"):
+            _save_jsonl(download_sycophancy_eval(n_sycophancy, seed), out)
+
     if "gsm8k" in targets:
         cache_gsm8k()
-
     if "mmlu" in targets:
         cache_mmlu()
-
     if "truthfulqa" in targets:
         cache_truthfulqa()
 
