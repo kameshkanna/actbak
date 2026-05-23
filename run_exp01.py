@@ -1,58 +1,41 @@
-"""Run experiment 01 (norm profiling) for all models in parallel.
-
-Each model is automatically assigned to one GPU — no manual flags needed.
-One model per GPU; all models run concurrently.
+"""Run experiment 01 (norm profiling) for all models sequentially on one GPU.
 
 Usage:
     python run_exp01.py
+    python run_exp01.py --models llama-3.1-8b-instruct mistral-7b-instruct
 """
 
 from __future__ import annotations
 
-import os
+import argparse
 import subprocess
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import yaml
 
 
 def get_models(config_path: str = "config/models.yml") -> list[str]:
     with open(config_path) as f:
-        cfg = yaml.safe_load(f)
-    return list(cfg.get("models", {}).keys())
-
-
-def run_model(gpu_id: int, model: str) -> tuple[str, int]:
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_id)}
-    result = subprocess.run(
-        [sys.executable, "experiments/01_norm_profiling.py", "--models", model],
-        env=env,
-    )
-    return model, result.returncode
+        return list(yaml.safe_load(f).get("models", {}).keys())
 
 
 def main() -> None:
-    models = get_models()
-    n_gpus = len(models)  # one GPU per model
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--models", nargs="*")
+    args = parser.parse_args()
 
-    print(f"Norm profiling: {len(models)} models across {n_gpus} GPUs", flush=True)
-    for i, m in enumerate(models):
-        print(f"  GPU {i} → {m}", flush=True)
-    print(flush=True)
+    models = args.models or get_models()
+    print(f"Norm profiling: {len(models)} models on cuda:0", flush=True)
 
-    failed: list[str] = []
-    with ProcessPoolExecutor(max_workers=n_gpus) as pool:
-        futures = {
-            pool.submit(run_model, i, model): model
-            for i, model in enumerate(models)
-        }
-        for future in as_completed(futures):
-            model, rc = future.result()
-            status = "OK" if rc == 0 else f"FAILED (rc={rc})"
-            print(f"  Finished: {model} [{status}]", flush=True)
-            if rc != 0:
-                failed.append(model)
+    failed = []
+    for model in models:
+        print(f"\n  → {model}", flush=True)
+        rc = subprocess.run(
+            [sys.executable, "experiments/01_norm_profiling.py", "--models", model]
+        ).returncode
+        if rc != 0:
+            print(f"  FAILED: {model}", flush=True)
+            failed.append(model)
 
     print("\n=== Done ===")
     if failed:
