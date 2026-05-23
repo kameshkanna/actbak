@@ -59,7 +59,7 @@ def load_model_and_tokenizer(
     logger.info("Loading model: %s  (dtype=%s, 4bit=%s)", hf_id, dtype, load_in_4bit)
     model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
         hf_id,
-        dtype=torch_dtype,
+        torch_dtype=torch_dtype,
         device_map=device_map,
         quantization_config=quantization_config,
         attn_implementation="sdpa",
