@@ -6,8 +6,6 @@ experiment:
   # Behavioral axes
   behaviors:
     - safety
-    - refusal
-    - sycophancy
 
   # K multipliers for the ramp magnitude sweep
   k_scales: [0.25, 0.5, 1.0, 2.0, 3.0, 5.0]
