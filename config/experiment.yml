@@ -3,18 +3,18 @@
 
 experiment:
 
-  # Behavioral axes
+  # Behavioral axes (safety-first; expand to sycophancy after validation)
   behaviors:
     - safety
-    - sycophancy
 
   # K multipliers for the ramp magnitude sweep
   k_scales: [0.25, 0.5, 1.0, 2.0, 3.0, 5.0]
 
   # Generation budget per prompt
-  max_new_tokens: 150
+  max_new_tokens: 300
 
-  # Judge model (SmallModelJudge)
+  # Judge model — GroqJudge uses this, SmallModelJudge uses judge_model
+  groq_judge_model: llama-3.3-70b-versatile
   judge_model: Qwen/Qwen2.5-3B-Instruct
   judge_batch_size: 8
 

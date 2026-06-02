@@ -53,7 +53,7 @@ from transformers import PreTrainedTokenizerBase
 
 from activation_baking.config import ExperimentConfig, ModelConfig, load_experiment_config, load_model_configs
 from activation_baking.direction_extractor import BehavioralDirection, load_directions
-from activation_baking.judges import SmallModelJudge
+from activation_baking.judges import GroqJudge
 from activation_baking.model_utils import format_prompt
 from activation_baking.norm_profiler import LayerNormStats, load_profile
 from activation_baking.registry import ModelRegistry
@@ -368,7 +368,7 @@ def run_model(
     )
 
     prompts = [item["prompt"] for item in eval_prompts]
-    judge   = SmallModelJudge(model_id=exp_cfg.judge_model)
+    judge   = GroqJudge(model_id=exp_cfg.groq_judge_model)
     records: list[dict] = []
 
     with registry.loaded(model_cfg) as (model, tokenizer):

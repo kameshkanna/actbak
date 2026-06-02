@@ -61,7 +61,7 @@ from typing import Any
 
 from activation_baking.config import ExperimentConfig, ModelConfig, load_experiment_config, load_model_configs
 from activation_baking.direction_extractor import load_directions
-from activation_baking.judges import SmallModelJudge
+from activation_baking.judges import GroqJudge
 from activation_baking.model_utils import format_prompt
 from transformers import PreTrainedTokenizerBase
 from activation_baking.registry import ModelRegistry
@@ -78,10 +78,34 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-CONDITIONS       = ["baseline", "ramp_pos", "ramp_neg"]
-STEER_CONDITIONS = ["ramp_pos", "ramp_neg"]
-CONDITION_COLORS = {"baseline": "#6b7280", "ramp_pos": "#2563eb", "ramp_neg": "#dc2626"}
-CONDITION_LABELS = {"baseline": "Baseline", "ramp_pos": "Ramp+", "ramp_neg": "Ramp−"}
+# Conditions: CAA mean_direction, both injection modes, both signs
+CONDITIONS = [
+    "baseline",
+    "caa_broadcast_pos",
+    "caa_broadcast_neg",
+    "caa_last_token_pos",
+    "caa_last_token_neg",
+]
+STEER_CONDITIONS = [
+    "caa_broadcast_pos",
+    "caa_broadcast_neg",
+    "caa_last_token_pos",
+    "caa_last_token_neg",
+]
+CONDITION_COLORS = {
+    "baseline":           "#6b7280",
+    "caa_broadcast_pos":  "#2563eb",
+    "caa_broadcast_neg":  "#93c5fd",
+    "caa_last_token_pos": "#dc2626",
+    "caa_last_token_neg": "#fca5a5",
+}
+CONDITION_LABELS = {
+    "baseline":           "Baseline",
+    "caa_broadcast_pos":  "CAA Broadcast +",
+    "caa_broadcast_neg":  "CAA Broadcast −",
+    "caa_last_token_pos": "CAA LastTok +",
+    "caa_last_token_neg": "CAA LastTok −",
+}
 
 # Behavior → eval prompt JSONL filenames (all under data/eval_prompts/)
 BEHAVIOR_SOURCES: dict[str, list[str]] = {
@@ -94,18 +118,31 @@ BEHAVIOR_SOURCES: dict[str, list[str]] = {
 # Steering configs
 # ---------------------------------------------------------------------------
 
-def _ramp_config(
-    directions: list, scale: float
-) -> dict[int, tuple[np.ndarray, float]]:
-    """Build a ramp+ steering config: +direction at K_ℓ × scale for each layer."""
-    return {d.layer_idx: (d.mean_direction, d.k_value * scale) for d in directions}
+def _caa_config(
+    directions: list,
+    scale: float,
+    sign: float,
+    inject_mode: str,
+) -> dict[int, tuple]:
+    """Build a CAA layer config using mean_direction (contrastive mean diff).
 
+    Args:
+        directions:   Extracted BehavioralDirection list (middle layers).
+        scale:        K multiplier.
+        sign:         +1.0 to amplify the behavior, -1.0 to suppress it.
+        inject_mode:  ``"broadcast"`` or ``"last_token"``.
+    """
+    return {
+        d.layer_idx: (sign * d.mean_direction, d.k_value * scale, inject_mode)
+        for d in directions
+    }
 
-def _neg_config(
-    directions: list, scale: float
-) -> dict[int, tuple[np.ndarray, float]]:
-    """Build a ramp- steering config: −direction at K_ℓ × scale for each layer."""
-    return {d.layer_idx: (-d.mean_direction, d.k_value * scale) for d in directions}
+_CONDITION_CONFIGS = {
+    "caa_broadcast_pos":  lambda dirs, s: _caa_config(dirs, s, +1.0, "broadcast"),
+    "caa_broadcast_neg":  lambda dirs, s: _caa_config(dirs, s, -1.0, "broadcast"),
+    "caa_last_token_pos": lambda dirs, s: _caa_config(dirs, s, +1.0, "last_token"),
+    "caa_last_token_neg": lambda dirs, s: _caa_config(dirs, s, -1.0, "last_token"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -238,22 +275,23 @@ def plot_results(
         scale:      K scale multiplier (used in plot titles).
         fig_dir:    Output directory for PDF figures.
     """
+    n_cond = len(CONDITIONS)
     agg = df.groupby("condition")["judge_score"].mean().reindex(CONDITIONS).fillna(0)
-    fig, ax = plt.subplots(figsize=(6, 4))
-    bars = ax.bar(range(3), agg.values, color=[CONDITION_COLORS[c] for c in CONDITIONS], width=0.5)
+    fig, ax = plt.subplots(figsize=(max(6, n_cond * 1.4), 4))
+    bars = ax.bar(range(n_cond), agg.values, color=[CONDITION_COLORS[c] for c in CONDITIONS], width=0.5)
     ax.bar_label(bars, fmt="%.3f", padding=3, fontsize=9)
-    ax.set_xticks(range(3))
+    ax.set_xticks(range(n_cond))
     ax.set_xticklabels([CONDITION_LABELS[c] for c in CONDITIONS], fontsize=9)
     ax.set_ylabel("Mean judge score")
-    ax.set_ylim(0, 1.15)
+    ax.set_ylim(-0.6, 1.15)
     ax.set_title(f"{model_name} | {behavior} | k={scale:.2f}")
     ax.grid(True, axis="y", alpha=0.3)
     _savefig(fig, fig_dir / "condition_comparison.pdf")
 
     sources = sorted(df["source"].unique())
     src_palette = {"harmbench": "#7c3aed", "clearharm": "#059669", "anthropic_syco": "#ea580c"}
-    x = np.arange(3)
-    fig, ax = plt.subplots(figsize=(7, 4))
+    x = np.arange(n_cond)
+    fig, ax = plt.subplots(figsize=(max(7, n_cond * 1.6), 4))
     for i, src in enumerate(sources):
         sub = (
             df[df["source"] == src]
@@ -263,13 +301,13 @@ def plot_results(
             .fillna(0)
         )
         ax.bar(
-            x + (i - len(sources) / 2 + 0.5) * 0.3, sub.values, 0.3,
+            x + (i - len(sources) / 2 + 0.5) * 0.25, sub.values, 0.25,
             label=src, color=src_palette.get(src, "gray"),
         )
     ax.set_xticks(x)
     ax.set_xticklabels([CONDITION_LABELS[c] for c in CONDITIONS], fontsize=9)
     ax.set_ylabel("Mean judge score")
-    ax.set_ylim(0, 1.15)
+    ax.set_ylim(-0.6, 1.15)
     ax.set_title(f"{model_name} | {behavior} | k={scale:.2f} — by source")
     ax.legend()
     ax.grid(True, axis="y", alpha=0.3)
@@ -369,7 +407,7 @@ def run_model(
         logger.info("=== %s — nothing to run ===", model_cfg.name)
         return
 
-    judge = SmallModelJudge(model_id=exp_cfg.judge_model)
+    judge = GroqJudge(model_id=exp_cfg.groq_judge_model)
 
     with registry.loaded(model_cfg) as (model, tokenizer):
         steerer = ActivationSteerer(model)
@@ -420,7 +458,7 @@ def run_model(
             )
 
             # ------------------------------------------------------------------
-            # K sweep: ramp_pos + ramp_neg only
+            # K sweep: mean_pos / mean_neg / pca_pos / pca_neg
             # ------------------------------------------------------------------
             pending_scales = [
                 s for s in k_scales
@@ -436,8 +474,7 @@ def run_model(
                 records: list[dict] = []
 
                 for condition in STEER_CONDITIONS:
-                    cfg = _ramp_config(directions, scale) if condition == "ramp_pos" \
-                          else _neg_config(directions, scale)
+                    cfg = _CONDITION_CONFIGS[condition](directions, scale)
                     logger.info(
                         "  [%s | %s | k=%.2f | %s]", model_cfg.name, behavior, scale, condition
                     )
