@@ -318,9 +318,9 @@ def plot_results(
         .reindex(columns=CONDITIONS)
         .fillna(0)
     )
-    fig, ax = plt.subplots(figsize=(6, max(4, len(pivot) * 0.3)))
+    fig, ax = plt.subplots(figsize=(max(6, n_cond * 1.2), max(4, len(pivot) * 0.3)))
     im = ax.imshow(pivot.values, aspect="auto", cmap="RdYlGn", vmin=0, vmax=1)
-    ax.set_xticks(range(3))
+    ax.set_xticks(range(n_cond))
     ax.set_xticklabels([CONDITION_LABELS[c] for c in CONDITIONS], fontsize=8)
     ax.set_yticks(range(len(pivot)))
     ax.set_yticklabels([str(pid)[:30] for pid in pivot.index], fontsize=6)
@@ -387,15 +387,25 @@ def run_model(
         batch_size:     Batch size for generation.
         force:          If True, overwrite existing results; otherwise skip.
     """
+    """Generate all responses for one model and checkpoint to disk.
+
+    Does NOT run the judge. Saves raw (unscored) responses to:
+      output_root/{model}/{behavior}/raw_responses.csv
+
+    Already-complete results (scored_results.csv present) are skipped.
+    Already-checkpointed raw responses are reloaded instead of regenerated.
+
+    Returns the checkpoint path if any new generation happened, else None.
+    """
     logger.info(
-        "=== %s — %d behaviors × %d scales ===",
+        "=== %s — generating %d behaviors × %d scales ===",
         model_cfg.name, len(behaviors), len(k_scales),
     )
 
     behavior_directions: dict[str, list] = {}
     for behavior in behaviors:
         if not force and _results_complete(output_root, model_cfg.name, behavior, k_scales):
-            logger.info("  [%s | %s] all results exist — skipping.", model_cfg.name, behavior)
+            logger.info("  [%s | %s] fully scored — skipping generation.", model_cfg.name, behavior)
             continue
         p = directions_dir / model_cfg.name / f"{behavior}.npz"
         if not p.exists():
@@ -404,18 +414,18 @@ def run_model(
         behavior_directions[behavior] = load_directions(str(p))
 
     if not behavior_directions:
-        logger.info("=== %s — nothing to run ===", model_cfg.name)
+        logger.info("=== %s — nothing to generate ===", model_cfg.name)
         return
 
-    # ------------------------------------------------------------------
-    # Phase 1: ALL generation — main model loaded, no judge yet
-    # Records keyed by (behavior, scale) for post-hoc scoring.
-    # Baseline is always generated; cached baselines are reloaded.
-    # ------------------------------------------------------------------
-    # pending_records[(behavior, scale)] = list of records without judge_score
-    pending_records: dict[tuple, list[dict]] = {}
-    # cached_baseline[behavior] = already-scored baseline records (from disk)
-    cached_baseline: dict[str, list[dict]] = {}
+    ckpt_path = output_root / model_cfg.name / "raw_responses.csv"
+
+    # Reload existing checkpoint if present (avoids re-generating on resume)
+    existing: pd.DataFrame = pd.DataFrame()
+    if not force and ckpt_path.exists():
+        existing = pd.read_csv(ckpt_path)
+        logger.info("  Loaded %d existing raw records from checkpoint.", len(existing))
+
+    new_records: list[dict] = []
 
     with registry.loaded(model_cfg) as (model, tokenizer):
         steerer = ActivationSteerer(model)
@@ -426,46 +436,49 @@ def run_model(
             directions   = behavior_directions[behavior]
 
             # Baseline
-            baseline_out = output_root / model_cfg.name / behavior / "baseline"
-            baseline_csv = baseline_out / "scored_results.csv"
-
-            if not force and baseline_csv.exists():
-                logger.info("  [%s | %s | baseline] cached — reloading.", model_cfg.name, behavior)
-                cached_baseline[behavior] = pd.read_csv(baseline_csv).to_dict("records")
+            baseline_scored = output_root / model_cfg.name / behavior / "baseline" / "scored_results.csv"
+            baseline_already_ckpt = (
+                not existing.empty
+                and "baseline" in existing.get("condition", pd.Series(dtype=str)).values
+                and behavior in existing.get("behavior", pd.Series(dtype=str)).values
+            )
+            if not force and baseline_scored.exists():
+                logger.info("  [%s | %s | baseline] scored CSV exists — skipping.", model_cfg.name, behavior)
+            elif not force and baseline_already_ckpt:
+                logger.info("  [%s | %s | baseline] checkpoint exists — skipping.", model_cfg.name, behavior)
             else:
                 logger.info("  [%s | %s | baseline] generating...", model_cfg.name, behavior)
-                baseline_resps = generate_batched(
+                resps = generate_batched(
                     model, tokenizer, steerer, {},
                     prompts, exp_cfg.max_new_tokens, batch_size, model_cfg.extra,
                 )
-                baseline_recs = [
-                    {
-                        "condition":          "baseline",
-                        "behavior":           behavior,
-                        "source":             item["source"],
-                        "prompt_id":          item["id"],
-                        "user_input":         item["prompt"],
-                        "response":           resp,
+                for item, resp in zip(eval_prompts, resps):
+                    new_records.append({
+                        "model_name": model_cfg.name, "condition": "baseline",
+                        "behavior": behavior, "source": item["source"],
+                        "prompt_id": item["id"], "user_input": item["prompt"],
+                        "response": resp,
                         "sycophantic_answer": item.get("sycophantic_answer", ""),
-                        "honest_answer":      item.get("honest_answer", ""),
-                    }
-                    for item, resp in zip(eval_prompts, baseline_resps)
-                ]
-                pending_records[(behavior, "baseline")] = baseline_recs
+                        "honest_answer": item.get("honest_answer", ""),
+                        "k_scale": None,
+                    })
 
             # K sweep
-            pending_scales = [
-                s for s in k_scales
-                if force or not (
-                    output_root / model_cfg.name / behavior / _k_tag(s) / "scored_results.csv"
-                ).exists()
-            ]
-            if not pending_scales:
-                logger.info("  [%s | %s] all k-scales cached — skipping.", model_cfg.name, behavior)
-                continue
+            for scale in k_scales:
+                scale_scored = output_root / model_cfg.name / behavior / _k_tag(scale) / "scored_results.csv"
+                scale_already_ckpt = (
+                    not existing.empty
+                    and not existing[
+                        (existing.get("behavior", "") == behavior) &
+                        (existing.get("k_scale", pd.Series(dtype=float)) == scale)
+                    ].empty
+                )
+                if not force and scale_scored.exists():
+                    continue
+                if not force and scale_already_ckpt:
+                    logger.info("  [%s | %s | k=%.2f] checkpoint exists — skipping.", model_cfg.name, behavior, scale)
+                    continue
 
-            for scale in tqdm(pending_scales, desc=f"{model_cfg.name}|{behavior}", dynamic_ncols=True):
-                scale_recs: list[dict] = []
                 for condition in STEER_CONDITIONS:
                     cfg = _CONDITION_CONFIGS[condition](directions, scale)
                     logger.info("  [%s | %s | k=%.2f | %s]", model_cfg.name, behavior, scale, condition)
@@ -474,75 +487,112 @@ def run_model(
                         prompts, exp_cfg.max_new_tokens, batch_size, model_cfg.extra,
                     )
                     for item, resp in zip(eval_prompts, resps):
-                        scale_recs.append({
-                            "condition":          condition,
-                            "behavior":           behavior,
-                            "source":             item["source"],
-                            "prompt_id":          item["id"],
-                            "user_input":         item["prompt"],
-                            "response":           resp,
+                        new_records.append({
+                            "model_name": model_cfg.name, "condition": condition,
+                            "behavior": behavior, "source": item["source"],
+                            "prompt_id": item["id"], "user_input": item["prompt"],
+                            "response": resp,
                             "sycophantic_answer": item.get("sycophantic_answer", ""),
-                            "honest_answer":      item.get("honest_answer", ""),
+                            "honest_answer": item.get("honest_answer", ""),
+                            "k_scale": scale,
                         })
-                pending_records[(behavior, scale)] = scale_recs
 
-    # ------------------------------------------------------------------
-    # Phase 2: judge all pending records at once — main model is unloaded
-    # ------------------------------------------------------------------
-    if not pending_records:
-        logger.info("=== %s — nothing to judge ===", model_cfg.name)
+    if new_records:
+        combined = pd.concat(
+            [existing, pd.DataFrame(new_records)], ignore_index=True
+        ) if not existing.empty else pd.DataFrame(new_records)
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        combined.to_csv(ckpt_path, index=False)
+        logger.info("=== %s checkpoint saved: %d total records ===", model_cfg.name, len(combined))
+    else:
+        logger.info("=== %s no new records to checkpoint ===", model_cfg.name)
+
+
+def score_and_save(
+    model_name: str,
+    behaviors: list[str],
+    k_scales: list[float],
+    output_root: Path,
+    figures_root: Path,
+    exp_cfg: ExperimentConfig,
+    force: bool = False,
+) -> None:
+    """Load raw_responses.csv checkpoint, score with judge, write final CSVs + plots."""
+    ckpt_path = output_root / model_name / "raw_responses.csv"
+    if not ckpt_path.exists():
+        logger.info("No checkpoint for %s — nothing to score.", model_name)
         return
 
-    all_to_judge = [r for recs in pending_records.values() for r in recs]
-    logger.info("Loading judge for %d records...", len(all_to_judge))
-    judge = SmallModelJudge(model_id=exp_cfg.judge_model)
-    all_scores = judge.score_records(all_to_judge, batch_size=exp_cfg.judge_batch_size)
+    raw = pd.read_csv(ckpt_path)
+    # Only score records that don't already have a scored CSV
+    to_score_rows = []
+    for _, row in raw.iterrows():
+        behavior = row["behavior"]
+        k_scale  = row["k_scale"]
+        if pd.isna(k_scale):  # baseline
+            dest = output_root / model_name / behavior / "baseline" / "scored_results.csv"
+        else:
+            dest = output_root / model_name / behavior / _k_tag(float(k_scale)) / "scored_results.csv"
+        if force or not dest.exists():
+            to_score_rows.append(row.to_dict())
+
+    if not to_score_rows:
+        logger.info("%s — all records already scored.", model_name)
+        return
+
+    logger.info("Scoring %d records for %s...", len(to_score_rows), model_name)
+    judge  = SmallModelJudge(model_id=exp_cfg.judge_model)
+    scores = judge.score_records(to_score_rows, batch_size=exp_cfg.judge_batch_size)
     judge.unload()
+    for rec, score in zip(to_score_rows, scores):
+        rec["judge_score"] = score
 
-    # Write scores back into records
-    idx = 0
-    for key, recs in pending_records.items():
-        for rec in recs:
-            rec["judge_score"] = all_scores[idx]
-            idx += 1
+    scored_df = pd.DataFrame(to_score_rows)
 
-    # ------------------------------------------------------------------
-    # Phase 3: save + plot
-    # ------------------------------------------------------------------
-    for behavior in behavior_directions:
-        # Save newly scored baseline (if we generated it)
-        if (behavior, "baseline") in pending_records:
-            baseline_recs = pending_records[(behavior, "baseline")]
-            baseline_out  = output_root / model_cfg.name / behavior / "baseline"
-            baseline_out.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame(baseline_recs).to_csv(baseline_out / "scored_results.csv", index=False)
-            cached_baseline[behavior] = baseline_recs
-            logger.info(
-                "  [%s | %s | baseline] mean_score=%.3f",
-                model_cfg.name, behavior,
-                float(np.mean([r["judge_score"] for r in baseline_recs])),
-            )
+    # Load any already-scored baselines from disk for inclusion in scale plots
+    def _load_baseline(behavior: str) -> list[dict]:
+        p = output_root / model_name / behavior / "baseline" / "scored_results.csv"
+        return pd.read_csv(p).to_dict("records") if p.exists() else []
 
-        baseline_rows = cached_baseline.get(behavior, [])
+    # Save baseline
+    for behavior in behaviors:
+        bl_rows = scored_df[
+            (scored_df["behavior"] == behavior) & (scored_df["condition"] == "baseline")
+        ]
+        if not bl_rows.empty:
+            out = output_root / model_name / behavior / "baseline"
+            out.mkdir(parents=True, exist_ok=True)
+            bl_rows.to_csv(out / "scored_results.csv", index=False)
+            logger.info("  [%s | %s | baseline] mean=%.3f", model_name, behavior,
+                        bl_rows["judge_score"].mean())
 
+    # Save each k-scale
+    for behavior in behaviors:
+        baseline_rows = _load_baseline(behavior)
         for scale in k_scales:
-            if (behavior, scale) not in pending_records:
+            scale_rows = scored_df[
+                (scored_df["behavior"] == behavior) &
+                (scored_df["k_scale"].notna()) &
+                (scored_df["k_scale"].astype(float) == scale)
+            ]
+            if scale_rows.empty:
                 continue
-            scale_recs  = pending_records[(behavior, scale)]
-            all_records = scale_recs + [dict(r) for r in baseline_rows]
-            out_dir     = output_root / model_cfg.name / behavior / _k_tag(scale)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            fig_dir     = figures_root / model_cfg.name / behavior / _k_tag(scale)
+            all_records = pd.concat(
+                [scale_rows, pd.DataFrame(baseline_rows)], ignore_index=True
+            ) if baseline_rows else scale_rows
 
-            df = pd.DataFrame(all_records)
-            df.to_csv(out_dir / "scored_results.csv", index=False)
-            summary = df.groupby("condition")["judge_score"].agg(["mean", "std", "count"])
+            out_dir = output_root / model_name / behavior / _k_tag(scale)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            fig_dir = figures_root / model_name / behavior / _k_tag(scale)
+
+            all_records.to_csv(out_dir / "scored_results.csv", index=False)
+            summary = all_records.groupby("condition")["judge_score"].agg(["mean", "std", "count"])
             summary.columns = ["mean_score", "std_score", "n"]
             summary.to_csv(out_dir / "summary.csv")
-            logger.info("%s | %s | k=%.2f\n%s", model_cfg.name, behavior, scale, summary.to_string())
-            plot_results(df, behavior, model_cfg.name, scale, fig_dir)
+            logger.info("%s | %s | k=%.2f\n%s", model_name, behavior, scale, summary.to_string())
+            plot_results(all_records, behavior, model_name, scale, fig_dir)
 
-    logger.info("=== %s done ===", model_cfg.name)
+    logger.info("=== %s scoring complete ===", model_name)
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +644,7 @@ def main() -> None:
         len(target_names), len(behaviors), len(k_scales), args.batch_size, args.force,
     )
 
+    # Phase 1: generate all models sequentially, checkpoint after each
     for name in target_names:
         run_model(
             model_cfg=all_configs[name],
@@ -606,6 +657,19 @@ def main() -> None:
             exp_cfg=exp_cfg,
             registry=registry,
             batch_size=args.batch_size,
+            force=args.force,
+        )
+
+    # Phase 2: score all checkpoints with judge loaded once per model
+    logger.info("All generation done. Starting judge pass...")
+    for name in target_names:
+        score_and_save(
+            model_name=name,
+            behaviors=behaviors,
+            k_scales=k_scales,
+            output_root=Path(args.output_dir),
+            figures_root=Path(args.figures_dir),
+            exp_cfg=exp_cfg,
             force=args.force,
         )
 
