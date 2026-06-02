@@ -86,7 +86,7 @@ def extract_behavior(
     """Extract and save behavioral directions for one model × behavior pair."""
     logger.info("--- %s | %s ---", model_cfg.name, behavior)
 
-    positives, negatives, contexts = load_pairs(pairs_path)
+    positives, negatives, _ = load_pairs(pairs_path)
     k_values = load_k_values(norm_profile_path, model_cfg)
 
     with registry.loaded(model_cfg) as (model, tokenizer):
@@ -96,7 +96,7 @@ def extract_behavior(
             model_cfg=model_cfg,
             k_values=k_values,
         )
-        directions = extractor.extract(positives, negatives, contexts=contexts)
+        directions = extractor.extract(positives, negatives)
 
     out_dir = output_dir / model_cfg.name
     out_dir.mkdir(parents=True, exist_ok=True)
