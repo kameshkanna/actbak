@@ -102,7 +102,6 @@ class DirectionExtractor:
         self._device: torch.device = next(model.parameters()).device
         self._hooks: list = []
         self._activations: dict[int, list[np.ndarray]] = {}
-        self._completion_start: int = 0
 
     # ------------------------------------------------------------------
     # Layer selection
@@ -110,14 +109,14 @@ class DirectionExtractor:
 
     @property
     def middle_layers(self) -> list[int]:
-        """Layer indices spanning the middle 50% of the network.
+        """Layer indices from 40% to 90% depth — matching original baking range.
 
         Returns:
-            Sorted list of integer layer indices from ``num_layers // 4`` to
-            ``(3 * num_layers) // 4 − 1`` inclusive.
+            Sorted list of integer layer indices from ``int(0.40 * num_layers)``
+            to ``int(0.90 * num_layers) − 1`` inclusive.
         """
-        start = self._num_layers // 4
-        end = (3 * self._num_layers) // 4
+        start = int(self._num_layers * 0.40)
+        end   = int(self._num_layers * 0.90)
         return list(range(start, end))
 
     # ------------------------------------------------------------------
@@ -125,11 +124,12 @@ class DirectionExtractor:
     # ------------------------------------------------------------------
 
     def _make_hook(self, layer_idx: int) -> Callable:
-        """Return a forward hook that captures mean-pooled hidden states.
+        """Return a forward hook that captures the last-token hidden state.
 
-        When ``_completion_start > 0``, pooling is restricted to the token
-        positions following that index, isolating the completion representation
-        from the shared context prefix.
+        Matches the original extraction logic: ``out[:, -1, :]``.
+        The last token carries the model's full contextual summary at that layer
+        and is what the model conditions next-token prediction on — making it
+        the correct position to extract a behavioral direction from.
 
         Args:
             layer_idx: Index of the transformer layer being hooked.
@@ -139,9 +139,7 @@ class DirectionExtractor:
         """
         def hook(module: nn.Module, input: tuple, output: tuple | torch.Tensor) -> None:
             hidden: torch.Tensor = output[0] if isinstance(output, tuple) else output
-            start = self._completion_start
-            segment = hidden[:, start:, :] if start > 0 and start < hidden.shape[1] else hidden
-            vec = segment.detach().float().mean(dim=1).squeeze(0).cpu().numpy()
+            vec = hidden[:, -1, :].detach().float().squeeze(0).cpu().numpy()
             self._activations[layer_idx].append(vec)
         return hook
 
@@ -171,18 +169,14 @@ class DirectionExtractor:
     def _collect_activations(
         self,
         prompts: list[str],
-        context_lens: list[int] | None = None,
     ) -> dict[int, np.ndarray]:
-        """Run prompts through the model and return per-layer activation matrices.
+        """Run prompts through the model and return per-layer last-token activation matrices.
 
         Each matrix has shape ``(n_prompts, hidden_size)``, containing the
-        mean-pooled hidden state at that layer for each prompt.
+        last-token hidden state at that layer for each prompt.
 
         Args:
-            prompts:      Full tokenizable strings (context + completion).
-            context_lens: If provided, pool activations over completion tokens
-                          only.  Each entry is the number of context tokens for
-                          the corresponding prompt.
+            prompts: Full tokenizable strings.
 
         Returns:
             Mapping of ``layer_idx → np.ndarray`` of shape ``(n, hidden_size)``.
@@ -192,10 +186,7 @@ class DirectionExtractor:
 
         self._register_hooks()
         try:
-            for i, prompt in enumerate(
-                tqdm(prompts, desc="  collecting", dynamic_ncols=True, leave=False)
-            ):
-                self._completion_start = context_lens[i] if context_lens is not None else 0
+            for prompt in tqdm(prompts, desc="  collecting", dynamic_ncols=True, leave=False):
                 inputs = self._tokenizer(
                     prompt,
                     return_tensors="pt",
@@ -209,7 +200,6 @@ class DirectionExtractor:
                     torch.cuda.empty_cache()
         finally:
             self._remove_hooks()
-            self._completion_start = 0
 
         return {idx: np.stack(self._activations[idx]) for idx in self.middle_layers}
 
@@ -222,55 +212,41 @@ class DirectionExtractor:
         pos_prompts: list[str],
         neg_prompts: list[str],
         n_pca_components: int = 5,
-        contexts: list[str] | None = None,
     ) -> list[BehavioralDirection]:
         """Extract behavioral directions from contrastive prompt pairs.
 
-        Passes both prompt sets through the model, computes per-layer activation
+        Passes both prompt sets through the model, captures the last-token hidden
+        state at each target layer (40–90% depth), computes per-layer activation
         differences ΔH_ℓ = H_ℓ(pos) − H_ℓ(neg), and fits PCA to obtain both a
         PCA direction (leading PC) and a mean direction (normalised mean diff).
 
+        Last-token extraction matches the original baking pipeline:
+        ``out[:, -1, :]`` captures what the model conditions next-token prediction
+        on, giving a cleaner behavioral signal than mean-pooling.
+
         Args:
-            pos_prompts:      Full strings (context + positive completion), one
+            pos_prompts:      Positive-pole strings (e.g. refusal responses), one
                               per contrastive pair.
-            neg_prompts:      Full strings (context + negative completion);
+            neg_prompts:      Negative-pole strings (e.g. compliant responses);
                               must be the same length as ``pos_prompts``.
             n_pca_components: Number of PCA components to fit.  Only PC1 is
                               retained; higher values improve numerical stability.
-            contexts:         Raw context strings shared by both poles.  When
-                              provided, activations are pooled over completion
-                              tokens only, yielding a sharper directional estimate
-                              uncontaminated by the identical context prefix.
 
         Returns:
-            List of ``BehavioralDirection`` objects, one per middle layer,
+            List of ``BehavioralDirection`` objects, one per target layer,
             sorted by ascending layer index.
 
         Raises:
-            AssertionError: If ``pos_prompts`` and ``neg_prompts`` lengths differ,
-                            or if ``contexts`` length does not match the pair count.
+            AssertionError: If ``pos_prompts`` and ``neg_prompts`` lengths differ.
         """
         assert len(pos_prompts) == len(neg_prompts), \
             "Positive and negative prompt counts must match."
 
-        context_lens: list[int] | None = None
-        if contexts is not None:
-            assert len(contexts) == len(pos_prompts), \
-                "contexts length must match number of pairs."
-            context_lens = [
-                len(self._tokenizer(ctx, add_special_tokens=True)["input_ids"])
-                for ctx in contexts
-            ]
-            logger.info(
-                "Completion-only pooling enabled. Mean context len: %.1f tokens",
-                sum(context_lens) / len(context_lens),
-            )
-
         logger.info("Collecting positive activations (%d prompts)...", len(pos_prompts))
-        pos_acts = self._collect_activations(pos_prompts, context_lens)
+        pos_acts = self._collect_activations(pos_prompts)
 
         logger.info("Collecting negative activations (%d prompts)...", len(neg_prompts))
-        neg_acts = self._collect_activations(neg_prompts, context_lens)
+        neg_acts = self._collect_activations(neg_prompts)
 
         directions: list[BehavioralDirection] = []
         for layer_idx in self.middle_layers:
