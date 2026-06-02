@@ -61,7 +61,7 @@ from typing import Any
 
 from activation_baking.config import ExperimentConfig, ModelConfig, load_experiment_config, load_model_configs
 from activation_baking.direction_extractor import load_directions
-from activation_baking.judges import GroqJudge
+from activation_baking.judges import SmallModelJudge
 from activation_baking.model_utils import format_prompt
 from transformers import PreTrainedTokenizerBase
 from activation_baking.registry import ModelRegistry
@@ -407,7 +407,15 @@ def run_model(
         logger.info("=== %s — nothing to run ===", model_cfg.name)
         return
 
-    judge = GroqJudge(model_id=exp_cfg.groq_judge_model)
+    # ------------------------------------------------------------------
+    # Phase 1: ALL generation — main model loaded, no judge yet
+    # Records keyed by (behavior, scale) for post-hoc scoring.
+    # Baseline is always generated; cached baselines are reloaded.
+    # ------------------------------------------------------------------
+    # pending_records[(behavior, scale)] = list of records without judge_score
+    pending_records: dict[tuple, list[dict]] = {}
+    # cached_baseline[behavior] = already-scored baseline records (from disk)
+    cached_baseline: dict[str, list[dict]] = {}
 
     with registry.loaded(model_cfg) as (model, tokenizer):
         steerer = ActivationSteerer(model)
@@ -417,22 +425,20 @@ def run_model(
             prompts      = [item["prompt"] for item in eval_prompts]
             directions   = behavior_directions[behavior]
 
-            # ------------------------------------------------------------------
-            # Baseline: run once per behavior (no hooks), cache scores
-            # ------------------------------------------------------------------
+            # Baseline
             baseline_out = output_root / model_cfg.name / behavior / "baseline"
             baseline_csv = baseline_out / "scored_results.csv"
 
             if not force and baseline_csv.exists():
-                logger.info("  [%s | %s | baseline] exists — loading cached.", model_cfg.name, behavior)
-                baseline_records = pd.read_csv(baseline_csv).to_dict("records")
+                logger.info("  [%s | %s | baseline] cached — reloading.", model_cfg.name, behavior)
+                cached_baseline[behavior] = pd.read_csv(baseline_csv).to_dict("records")
             else:
-                logger.info("  [%s | %s | baseline]", model_cfg.name, behavior)
+                logger.info("  [%s | %s | baseline] generating...", model_cfg.name, behavior)
                 baseline_resps = generate_batched(
                     model, tokenizer, steerer, {},
                     prompts, exp_cfg.max_new_tokens, batch_size, model_cfg.extra,
                 )
-                baseline_records = [
+                baseline_recs = [
                     {
                         "condition":          "baseline",
                         "behavior":           behavior,
@@ -445,21 +451,9 @@ def run_model(
                     }
                     for item, resp in zip(eval_prompts, baseline_resps)
                 ]
-                baseline_scores = judge.score_records(baseline_records, batch_size=exp_cfg.judge_batch_size)
-                for rec, score in zip(baseline_records, baseline_scores):
-                    rec["judge_score"] = score
-                baseline_out.mkdir(parents=True, exist_ok=True)
-                pd.DataFrame(baseline_records).to_csv(baseline_csv, index=False)
+                pending_records[(behavior, "baseline")] = baseline_recs
 
-            logger.info(
-                "  [%s | %s | baseline] mean_score=%.3f",
-                model_cfg.name, behavior,
-                float(np.mean([r["judge_score"] for r in baseline_records])),
-            )
-
-            # ------------------------------------------------------------------
-            # K sweep: mean_pos / mean_neg / pca_pos / pca_neg
-            # ------------------------------------------------------------------
+            # K sweep
             pending_scales = [
                 s for s in k_scales
                 if force or not (
@@ -467,23 +461,20 @@ def run_model(
                 ).exists()
             ]
             if not pending_scales:
-                logger.info("  [%s | %s] all k-scales exist — skipping sweep.", model_cfg.name, behavior)
+                logger.info("  [%s | %s] all k-scales cached — skipping.", model_cfg.name, behavior)
                 continue
 
             for scale in tqdm(pending_scales, desc=f"{model_cfg.name}|{behavior}", dynamic_ncols=True):
-                records: list[dict] = []
-
+                scale_recs: list[dict] = []
                 for condition in STEER_CONDITIONS:
                     cfg = _CONDITION_CONFIGS[condition](directions, scale)
-                    logger.info(
-                        "  [%s | %s | k=%.2f | %s]", model_cfg.name, behavior, scale, condition
-                    )
+                    logger.info("  [%s | %s | k=%.2f | %s]", model_cfg.name, behavior, scale, condition)
                     resps = generate_batched(
                         model, tokenizer, steerer, cfg,
                         prompts, exp_cfg.max_new_tokens, batch_size, model_cfg.extra,
                     )
                     for item, resp in zip(eval_prompts, resps):
-                        records.append({
+                        scale_recs.append({
                             "condition":          condition,
                             "behavior":           behavior,
                             "source":             item["source"],
@@ -493,28 +484,64 @@ def run_model(
                             "sycophantic_answer": item.get("sycophantic_answer", ""),
                             "honest_answer":      item.get("honest_answer", ""),
                         })
+                pending_records[(behavior, scale)] = scale_recs
 
-                steer_scores = judge.score_records(records, batch_size=exp_cfg.judge_batch_size)
-                for rec, score in zip(records, steer_scores):
-                    rec["judge_score"] = score
+    # ------------------------------------------------------------------
+    # Phase 2: judge all pending records at once — main model is unloaded
+    # ------------------------------------------------------------------
+    if not pending_records:
+        logger.info("=== %s — nothing to judge ===", model_cfg.name)
+        return
 
-                all_records = records + [dict(r) for r in baseline_records]
-
-                out_dir = output_root / model_cfg.name / behavior / _k_tag(scale)
-                out_dir.mkdir(parents=True, exist_ok=True)
-                fig_dir = figures_root / model_cfg.name / behavior / _k_tag(scale)
-
-                df = pd.DataFrame(all_records)
-                df.to_csv(out_dir / "scored_results.csv", index=False)
-                summary = df.groupby("condition")["judge_score"].agg(["mean", "std", "count"])
-                summary.columns = ["mean_score", "std_score", "n"]
-                summary.to_csv(out_dir / "summary.csv")
-                logger.info(
-                    "%s | %s | k=%.2f\n%s", model_cfg.name, behavior, scale, summary.to_string()
-                )
-                plot_results(df, behavior, model_cfg.name, scale, fig_dir)
-
+    all_to_judge = [r for recs in pending_records.values() for r in recs]
+    logger.info("Loading judge for %d records...", len(all_to_judge))
+    judge = SmallModelJudge(model_id=exp_cfg.judge_model)
+    all_scores = judge.score_records(all_to_judge, batch_size=exp_cfg.judge_batch_size)
     judge.unload()
+
+    # Write scores back into records
+    idx = 0
+    for key, recs in pending_records.items():
+        for rec in recs:
+            rec["judge_score"] = all_scores[idx]
+            idx += 1
+
+    # ------------------------------------------------------------------
+    # Phase 3: save + plot
+    # ------------------------------------------------------------------
+    for behavior in behavior_directions:
+        # Save newly scored baseline (if we generated it)
+        if (behavior, "baseline") in pending_records:
+            baseline_recs = pending_records[(behavior, "baseline")]
+            baseline_out  = output_root / model_cfg.name / behavior / "baseline"
+            baseline_out.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(baseline_recs).to_csv(baseline_out / "scored_results.csv", index=False)
+            cached_baseline[behavior] = baseline_recs
+            logger.info(
+                "  [%s | %s | baseline] mean_score=%.3f",
+                model_cfg.name, behavior,
+                float(np.mean([r["judge_score"] for r in baseline_recs])),
+            )
+
+        baseline_rows = cached_baseline.get(behavior, [])
+
+        for scale in k_scales:
+            if (behavior, scale) not in pending_records:
+                continue
+            scale_recs  = pending_records[(behavior, scale)]
+            all_records = scale_recs + [dict(r) for r in baseline_rows]
+            out_dir     = output_root / model_cfg.name / behavior / _k_tag(scale)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            fig_dir     = figures_root / model_cfg.name / behavior / _k_tag(scale)
+
+            df = pd.DataFrame(all_records)
+            df.to_csv(out_dir / "scored_results.csv", index=False)
+            summary = df.groupby("condition")["judge_score"].agg(["mean", "std", "count"])
+            summary.columns = ["mean_score", "std_score", "n"]
+            summary.to_csv(out_dir / "summary.csv")
+            logger.info("%s | %s | k=%.2f\n%s", model_cfg.name, behavior, scale, summary.to_string())
+            plot_results(df, behavior, model_cfg.name, scale, fig_dir)
+
     logger.info("=== %s done ===", model_cfg.name)
 
 

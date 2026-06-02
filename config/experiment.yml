@@ -13,9 +13,8 @@ experiment:
   # Generation budget per prompt
   max_new_tokens: 300
 
-  # Judge model — GroqJudge uses this, SmallModelJudge uses judge_model
-  groq_judge_model: llama-3.3-70b-versatile
-  judge_model: Qwen/Qwen2.5-3B-Instruct
+  # Judge — loaded after all generation is complete, runs on GH200
+  judge_model: Qwen/Qwen2.5-32B-Instruct
   judge_batch_size: 8
 
   # Evaluation sample counts

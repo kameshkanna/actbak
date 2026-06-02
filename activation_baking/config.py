@@ -80,8 +80,7 @@ class ExperimentConfig:
         behaviors:                  Behavioral axes to evaluate.
         k_scales:                   K multipliers for the ramp sweep.
         max_new_tokens:             Token budget for model generation.
-        groq_judge_model:           Groq model id for GroqJudge (primary scorer).
-        judge_model:                HuggingFace id of the SmallModelJudge (legacy fallback).
+        judge_model:                HuggingFace id for SmallModelJudge (loaded after generation).
         judge_batch_size:           Prompts per judge forward pass.
         n_harmbench:                HarmBench samples for safety eval.
         n_clearharm:                ClearHarm samples for safety eval.
@@ -103,8 +102,7 @@ class ExperimentConfig:
     behaviors: list[str] = field(default_factory=lambda: ["safety", "sycophancy"])
     k_scales: list[float] = field(default_factory=lambda: [0.25, 0.5, 1.0, 2.0, 3.0, 5.0])
     max_new_tokens: int = 300
-    groq_judge_model: str = "llama-3.3-70b-versatile"
-    judge_model: str = "Qwen/Qwen2.5-3B-Instruct"
+    judge_model: str = "Qwen/Qwen2.5-32B-Instruct"
     judge_batch_size: int = 8
     n_harmbench: int = 200
     n_clearharm: int = 200
