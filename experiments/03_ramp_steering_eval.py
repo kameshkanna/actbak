@@ -333,8 +333,8 @@ def plot_results(
 # Per-model runner
 # ---------------------------------------------------------------------------
 
-def _k_tag(scale: float) -> str:
-    return f"k{scale:.2f}".replace(".", "_")
+def _k_tag(scale) -> str:
+    return f"k{float(scale):.2f}".replace(".", "_")
 
 
 def _results_complete(
@@ -465,7 +465,7 @@ def run_model(
             ]
 
             for scale in tqdm(pending_scales, desc=f"{behavior} k-sweep", leave=False, dynamic_ncols=True):
-                for condition in tqdm(STEER_CONDITIONS, desc=f"k={scale:.2f}", leave=False, dynamic_ncols=True):
+                for condition in tqdm(STEER_CONDITIONS, desc=f"k={float(scale):.2f}", leave=False, dynamic_ncols=True):
                     if not force and _is_ckpt(behavior, condition, scale):
                         continue
                     cfg   = _CONDITION_CONFIGS[condition](directions, scale)
