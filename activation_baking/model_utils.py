@@ -56,13 +56,22 @@ def load_model_and_tokenizer(
             bnb_4bit_quant_type="nf4",
         )
 
-    logger.info("Loading model: %s  (dtype=%s, 4bit=%s)", hf_id, dtype, load_in_4bit)
+    # Use flash_attention_2 when available (significantly faster on A100/H100),
+    # fall back to sdpa which is still faster than eager.
+    attn_impl = "sdpa"
+    try:
+        import flash_attn  # noqa: F401
+        attn_impl = "flash_attention_2"
+    except ImportError:
+        pass
+
+    logger.info("Loading model: %s  (dtype=%s, 4bit=%s, attn=%s)", hf_id, dtype, load_in_4bit, attn_impl)
     model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
         hf_id,
         torch_dtype=torch_dtype,
         device_map=device_map,
         quantization_config=quantization_config,
-        attn_implementation="sdpa",
+        attn_implementation=attn_impl,
     )
     model.eval()
 

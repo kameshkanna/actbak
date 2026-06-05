@@ -700,42 +700,72 @@ def main() -> None:
     }
 
     # -----------------------------------------------------------------------
-    # Phase 1 — parallel generation: assign each model its own GPU slice
-    # Models run simultaneously; checkpoint saved per model on completion.
+    # Phase 1 — generation
+    #
+    # Two modes depending on gpus_per_model:
+    #   gpus_per_model == n_gpus  →  sequential, all GPUs per model (max throughput
+    #                                per model, 1.6TB RAM keeps weights between runs)
+    #   gpus_per_model < n_gpus   →  parallel subprocesses, each pinned to a GPU slice
     # -----------------------------------------------------------------------
-    logger.info("Phase 1: launching %d parallel generation workers...", min(len(target_names), n_parallel))
-    mp.set_start_method("spawn", force=True)
-
-    # Assign GPU slices: model i gets GPUs [i*gpus_per_model : (i+1)*gpus_per_model]
-    gpu_assignments = [
-        list(range(i * gpus_per_model, min((i + 1) * gpus_per_model, n_gpus)))
-        for i in range(len(target_names))
-    ]
-
-    processes = []
-    for i, name in enumerate(target_names):
-        gpu_ids = gpu_assignments[i] if i < len(gpu_assignments) else [i % n_gpus]
-        p = mp.Process(
-            target=_generation_worker,
-            args=(name, gpu_ids, args_dict, all_configs_dict, exp_cfg_dict),
-            name=f"gen-{name}",
-        )
-        p.start()
-        logger.info("  Started worker for %s on GPU(s) %s (pid=%d)", name, gpu_ids, p.pid)
-        processes.append((name, p))
-
-    # Wait for all generation workers to finish
     failed = []
-    for name, p in processes:
-        p.join()
-        if p.exitcode != 0:
-            logger.error("  Worker for %s exited with code %d", name, p.exitcode)
-            failed.append(name)
-        else:
-            logger.info("  Worker for %s done.", name)
 
-    if failed:
-        logger.error("Generation failed for: %s — judge phase will skip these.", failed)
+    if gpus_per_model >= n_gpus:
+        # All GPUs to one model at a time — sequential, no subprocess overhead
+        logger.info(
+            "Phase 1: sequential mode — all %d GPUs per model, batch_size=%d",
+            n_gpus, args.batch_size,
+        )
+        registry = ModelRegistry(load_in_4bit=args.load_in_4bit, device_map="auto")
+        for name in tqdm(target_names, desc="Generation", unit="model", dynamic_ncols=True):
+            run_model(
+                model_cfg=all_configs[name],
+                behaviors=behaviors,
+                k_scales=k_scales,
+                eval_dir=Path(args.eval_prompts),
+                directions_dir=Path(args.directions),
+                output_root=output_root,
+                figures_root=figures_root,
+                exp_cfg=exp_cfg,
+                registry=registry,
+                batch_size=args.batch_size,
+                force=args.force,
+            )
+
+    else:
+        # Parallel subprocesses — each model gets its own GPU slice
+        logger.info(
+            "Phase 1: parallel mode — %d models × %d GPUs each",
+            min(len(target_names), n_parallel), gpus_per_model,
+        )
+        mp.set_start_method("spawn", force=True)
+
+        gpu_assignments = [
+            list(range(i * gpus_per_model, min((i + 1) * gpus_per_model, n_gpus)))
+            for i in range(len(target_names))
+        ]
+
+        processes = []
+        for i, name in enumerate(target_names):
+            gpu_ids = gpu_assignments[i] if i < len(gpu_assignments) else [i % n_gpus]
+            p = mp.Process(
+                target=_generation_worker,
+                args=(name, gpu_ids, args_dict, all_configs_dict, exp_cfg_dict),
+                name=f"gen-{name}",
+            )
+            p.start()
+            logger.info("  Started %s on GPU(s) %s (pid=%d)", name, gpu_ids, p.pid)
+            processes.append((name, p))
+
+        for name, p in processes:
+            p.join()
+            if p.exitcode != 0:
+                logger.error("  Worker for %s exited with code %d", name, p.exitcode)
+                failed.append(name)
+            else:
+                logger.info("  Worker for %s done.", name)
+
+        if failed:
+            logger.error("Generation failed for: %s", failed)
 
     # -----------------------------------------------------------------------
     # Phase 2 — judge all checkpoints; Qwen32B uses all GPUs via device_map=auto
