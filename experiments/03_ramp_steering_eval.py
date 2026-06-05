@@ -533,7 +533,7 @@ def score_and_save(
         return
 
     logger.info("=== [JUDGE] %s — %d records ===", model_name, len(to_score))
-    judge  = SmallModelJudge(model_id=exp_cfg.judge_model)
+    judge  = SmallModelJudge(model_id=exp_cfg.judge_model, device_map="auto")
     scores = judge.score_records(to_score, batch_size=exp_cfg.judge_batch_size)
     judge.unload()
 
@@ -600,11 +600,60 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force",        action="store_true",
                         help="Overwrite existing results instead of skipping.")
     parser.add_argument("--load-in-4bit", action="store_true")
+    parser.add_argument("--gpus-per-model", type=int, default=1,
+                        help="Number of GPUs per model (default 1). Total GPUs used = models × gpus-per-model.")
     return parser.parse_args()
 
 
+def _generation_worker(
+    name: str,
+    gpu_ids: list[int],
+    args_dict: dict,
+    all_configs_dict: dict,
+    exp_cfg_dict: dict,
+) -> None:
+    """Subprocess worker: generate one model on assigned GPUs and checkpoint."""
+    import os as _os
+    # Restrict this process to its assigned GPUs
+    _os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
+
+    # Re-import inside subprocess (avoids CUDA fork issues)
+    import logging as _logging
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format=f"%(asctime)s | GPU{gpu_ids} | %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    from activation_baking.config import ModelConfig, ExperimentConfig
+    from activation_baking.registry import ModelRegistry
+
+    model_cfg = ModelConfig(**all_configs_dict[name])
+    exp_cfg   = ExperimentConfig(**exp_cfg_dict)
+
+    device_map = "cuda:0" if len(gpu_ids) == 1 else "auto"
+    registry   = ModelRegistry(load_in_4bit=args_dict["load_in_4bit"], device_map=device_map)
+
+    run_model(
+        model_cfg=model_cfg,
+        behaviors=args_dict["behaviors"],
+        k_scales=[float(s) for s in args_dict["k_scales"]],
+        eval_dir=Path(args_dict["eval_prompts"]),
+        directions_dir=Path(args_dict["directions"]),
+        output_root=Path(args_dict["output_dir"]),
+        figures_root=Path(args_dict["figures_dir"]),
+        exp_cfg=exp_cfg,
+        registry=registry,
+        batch_size=args_dict["batch_size"],
+        force=args_dict["force"],
+    )
+
+
 def main() -> None:
-    args     = parse_args()
+    import multiprocessing as mp
+    from dataclasses import asdict
+
+    args        = parse_args()
     all_configs = load_model_configs(args.config)
     exp_cfg     = load_experiment_config(args.experiment_config)
 
@@ -620,43 +669,81 @@ def main() -> None:
         target_names = [n for n, c in all_configs.items() if c.is_instruct]
 
     behaviors = args.behaviors or exp_cfg.behaviors
-    k_scales  = args.k_scales  or exp_cfg.k_scales
-    registry  = ModelRegistry(load_in_4bit=args.load_in_4bit, device_map="cuda:0")
-
-    logger.info(
-        "%d models × %d behaviors × %d k-scales | batch_size=%d | force=%s",
-        len(target_names), len(behaviors), len(k_scales), args.batch_size, args.force,
-    )
+    k_scales  = [float(s) for s in (args.k_scales or exp_cfg.k_scales)]
 
     output_root  = Path(args.output_dir)
     figures_root = Path(args.figures_dir)
-    eval_dir     = Path(args.eval_prompts)
-    directions   = Path(args.directions)
+
+    n_gpus        = torch.cuda.device_count()
+    gpus_per_model = args.gpus_per_model
+    n_parallel     = max(1, n_gpus // gpus_per_model)
+
+    logger.info(
+        "%d models × %d behaviors × %d k-scales | batch=%d | GPUs=%d | parallel=%d | gpus_per_model=%d",
+        len(target_names), len(behaviors), len(k_scales),
+        args.batch_size, n_gpus, n_parallel, gpus_per_model,
+    )
+
+    # Serialise configs for subprocess workers (dataclasses → dicts)
+    all_configs_dict = {n: asdict(c) for n, c in all_configs.items()}
+    exp_cfg_dict     = asdict(exp_cfg)
+    args_dict = {
+        "behaviors":    behaviors,
+        "k_scales":     k_scales,
+        "eval_prompts": args.eval_prompts,
+        "directions":   args.directions,
+        "output_dir":   args.output_dir,
+        "figures_dir":  args.figures_dir,
+        "batch_size":   args.batch_size,
+        "force":        args.force,
+        "load_in_4bit": args.load_in_4bit,
+    }
 
     # -----------------------------------------------------------------------
-    # Phase 1 — generate all models, checkpoint after each one
-    # Judge is NOT loaded yet; GPU memory is fully dedicated to generation.
+    # Phase 1 — parallel generation: assign each model its own GPU slice
+    # Models run simultaneously; checkpoint saved per model on completion.
     # -----------------------------------------------------------------------
-    for name in tqdm(target_names, desc="Generation", unit="model", dynamic_ncols=True):
-        run_model(
-            model_cfg=all_configs[name],
-            behaviors=behaviors,
-            k_scales=k_scales,
-            eval_dir=eval_dir,
-            directions_dir=directions,
-            output_root=output_root,
-            figures_root=figures_root,
-            exp_cfg=exp_cfg,
-            registry=registry,
-            batch_size=args.batch_size,
-            force=args.force,
+    logger.info("Phase 1: launching %d parallel generation workers...", min(len(target_names), n_parallel))
+    mp.set_start_method("spawn", force=True)
+
+    # Assign GPU slices: model i gets GPUs [i*gpus_per_model : (i+1)*gpus_per_model]
+    gpu_assignments = [
+        list(range(i * gpus_per_model, min((i + 1) * gpus_per_model, n_gpus)))
+        for i in range(len(target_names))
+    ]
+
+    processes = []
+    for i, name in enumerate(target_names):
+        gpu_ids = gpu_assignments[i] if i < len(gpu_assignments) else [i % n_gpus]
+        p = mp.Process(
+            target=_generation_worker,
+            args=(name, gpu_ids, args_dict, all_configs_dict, exp_cfg_dict),
+            name=f"gen-{name}",
         )
+        p.start()
+        logger.info("  Started worker for %s on GPU(s) %s (pid=%d)", name, gpu_ids, p.pid)
+        processes.append((name, p))
+
+    # Wait for all generation workers to finish
+    failed = []
+    for name, p in processes:
+        p.join()
+        if p.exitcode != 0:
+            logger.error("  Worker for %s exited with code %d", name, p.exitcode)
+            failed.append(name)
+        else:
+            logger.info("  Worker for %s done.", name)
+
+    if failed:
+        logger.error("Generation failed for: %s — judge phase will skip these.", failed)
 
     # -----------------------------------------------------------------------
-    # Phase 2 — all generation done; load judge and score each model in turn
+    # Phase 2 — judge all checkpoints; Qwen32B uses all GPUs via device_map=auto
     # -----------------------------------------------------------------------
-    logger.info("All generation complete. Starting judge phase...")
+    logger.info("Phase 2: all generation done, starting judge pass (all GPUs)...")
     for name in tqdm(target_names, desc="Judging", unit="model", dynamic_ncols=True):
+        if name in failed:
+            continue
         score_and_save(
             model_name=name,
             behaviors=behaviors,
