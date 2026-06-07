@@ -1,43 +1,48 @@
 """Experiment 03 — Ramp steering evaluation across all models, behaviors, and K scales.
 
 For each model × behavior:
-  1. Run baseline once (no hooks) on behavior-specific eval prompts.
-  2. Sweep K scales: steer with ramp_pos and ramp_neg at K_ℓ × scale.
-  3. Score all responses with the behavior-appropriate SmallModelJudge.
-  4. Save CSV + summary + plots per (behavior, k_scale).
+  1. Run baseline once (no hooks) and all 4 steering conditions across all K scales.
+  2. All conditions are distributed in parallel across N GPU workers via
+     ``DataParallelGenerator`` (data-parallel; one model copy per GPU).
+  3. After all generation completes, SmallModelJudge scores the full checkpoint
+     using ``device_map="auto"`` across all GPUs.
+  4. Saves scored CSVs + summary tables + plots per (behavior, k_scale).
+
+Why data parallelism, not tensor parallelism (device_map="auto") or vLLM:
+  - ``device_map="auto"`` pipeline-parallelises a single model across GPUs,
+    serialising token flow and causing large pipeline bubbles — typically
+    *slower* than 1 GPU for 7–9 B models that fit on one 40 GB card.
+  - vLLM uses custom CUDA kernels that bypass ``register_forward_hook``
+    entirely; our ``ActivationSteerer`` hooks would silently not fire.
+  - Data parallelism replicates the full model on each GPU and fans out tasks;
+    each worker owns its own model + steerer.  Full hook support, near-N× speed.
 
 Behavior → benchmark mapping:
   safety     →  HarmBench + ClearHarm  (refusal scoring: SAFE / UNSAFE)
   sycophancy →  Anthropic model-written-evals  (SYCOPHANTIC / CONSISTENT)
 
-Skip logic: any (model, behavior, k_scale) whose scored_results.csv already
+Skip logic: any (model, behavior, k_scale) whose ``scored_results.csv`` already
 exists is silently skipped.  Re-run from scratch with --force.
 
 Base model support: base models (is_instruct=False) are evaluated using the
 prompt_template defined in their extra config (models.yml).  By default only
 instruct models run; pass --include-base or name them explicitly via --models.
 
-Optimised for single GH200 (96 GB): one model load per model, judge loaded
-alongside main model (no unload/reload), batch_size=64.
-
 Usage:
-    # All instruct models, all behaviors, all K scales
-    python experiments/03_ramp_steering_eval.py
+    # All instruct models, all behaviors — 8 GPU workers in parallel
+    python experiments/03_ramp_steering_eval.py --n-gpus 8
 
-    # Include base models alongside instruct
-    python experiments/03_ramp_steering_eval.py --include-base
-
-    # Explicit model list (instruct + base mixed)
+    # Only safety behavior, explicit models
     python experiments/03_ramp_steering_eval.py \\
-        --models llama-3.1-8b-instruct llama-3.1-8b \\
         --behaviors safety \\
-        --k-scales 0.5 1.0 2.0
+        --models llama-3.1-8b-instruct qwen2.5-7b-instruct \\
+        --n-gpus 8
+
+    # Single-GPU debug run
+    python experiments/03_ramp_steering_eval.py --n-gpus 1 --batch-size 8
 
     # Force re-run even if results already exist
-    python experiments/03_ramp_steering_eval.py --force
-
-    # Tune batch size to GPU VRAM (GH200 default: 64)
-    python experiments/03_ramp_steering_eval.py --batch-size 128
+    python experiments/03_ramp_steering_eval.py --force --n-gpus 8
 """
 
 from __future__ import annotations
@@ -47,7 +52,9 @@ import json
 import logging
 import os
 import sys
+from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 import matplotlib
 matplotlib.use("Agg")
@@ -57,15 +64,14 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-from typing import Any
-
 from activation_baking.config import ExperimentConfig, ModelConfig, load_experiment_config, load_model_configs
 from activation_baking.direction_extractor import load_directions
+from activation_baking.generation import DataParallelGenerator, generate_batched
 from activation_baking.judges import SmallModelJudge
 from activation_baking.model_utils import format_prompt
-from transformers import PreTrainedTokenizerBase
 from activation_baking.registry import ModelRegistry
 from activation_baking.steerer import ActivationSteerer
+from transformers import PreTrainedTokenizerBase
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -107,7 +113,6 @@ CONDITION_LABELS = {
     "caa_last_token_neg": "CAA LastTok −",
 }
 
-# Behavior → eval prompt JSONL filenames (all under data/eval_prompts/)
 BEHAVIOR_SOURCES: dict[str, list[str]] = {
     "safety":     ["harmbench.jsonl", "clearharm.jsonl"],
     "sycophancy": ["sycophancy.jsonl"],
@@ -118,6 +123,7 @@ BEHAVIOR_SOURCES: dict[str, list[str]] = {
 # Steering configs
 # ---------------------------------------------------------------------------
 
+
 def _caa_config(
     directions: list,
     scale: float,
@@ -127,17 +133,18 @@ def _caa_config(
     """Build a CAA layer config using mean_direction (contrastive mean diff).
 
     Args:
-        directions:   Extracted BehavioralDirection list (middle layers).
-        scale:        K multiplier.
-        sign:         +1.0 to amplify the behavior, -1.0 to suppress it.
-        inject_mode:  ``"broadcast"`` or ``"last_token"``.
+        directions:  Extracted ``BehavioralDirection`` list (middle layers).
+        scale:       K multiplier.
+        sign:        +1.0 to amplify the behavior, -1.0 to suppress it.
+        inject_mode: ``"broadcast"`` or ``"last_token"``.
     """
     return {
         d.layer_idx: (sign * d.mean_direction, d.k_value * scale, inject_mode)
         for d in directions
     }
 
-_CONDITION_CONFIGS = {
+
+_CONDITION_CONFIGS: dict[str, Any] = {
     "caa_broadcast_pos":  lambda dirs, s: _caa_config(dirs, s, +1.0, "broadcast"),
     "caa_broadcast_neg":  lambda dirs, s: _caa_config(dirs, s, -1.0, "broadcast"),
     "caa_last_token_pos": lambda dirs, s: _caa_config(dirs, s, +1.0, "last_token"),
@@ -148,6 +155,7 @@ _CONDITION_CONFIGS = {
 # ---------------------------------------------------------------------------
 # Eval prompt loading
 # ---------------------------------------------------------------------------
+
 
 def load_behavior_prompts(behavior: str, eval_dir: Path) -> list[dict]:
     """Load eval prompts for a specific behavior from its dedicated JSONL files.
@@ -160,8 +168,8 @@ def load_behavior_prompts(behavior: str, eval_dir: Path) -> list[dict]:
         List of prompt records; each has at minimum ``source``, ``id``, ``prompt``.
 
     Raises:
-        KeyError:    If ``behavior`` is not in ``BEHAVIOR_SOURCES``.
-        SystemExit:  If any required JSONL file is missing (user must download first).
+        KeyError:   If ``behavior`` is not in ``BEHAVIOR_SOURCES``.
+        SystemExit: If any required JSONL file is missing.
     """
     if behavior not in BEHAVIOR_SOURCES:
         raise KeyError(
@@ -186,72 +194,9 @@ def load_behavior_prompts(behavior: str, eval_dir: Path) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Batched generation
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def generate_batched(
-    model: torch.nn.Module,
-    tokenizer: PreTrainedTokenizerBase,
-    steerer: ActivationSteerer,
-    layer_config: dict[int, tuple[np.ndarray, float]],
-    prompts: list[str],
-    max_new_tokens: int,
-    batch_size: int,
-    extra_cfg: dict[str, Any],
-) -> list[str]:
-    """Generate responses for all prompts in batches under an optional steering config.
-
-    Args:
-        model:          Loaded causal LM.
-        tokenizer:      Corresponding tokenizer.
-        steerer:        ActivationSteerer bound to the model.
-        layer_config:   Steering config passed to ``steerer.steer()``.
-                        Empty dict → baseline (no hooks attached).
-        prompts:        Raw user prompt strings (chat template applied internally).
-        max_new_tokens: Maximum tokens to generate per prompt.
-        batch_size:     Number of prompts per forward pass.
-        extra_cfg:      Per-model extras forwarded to ``format_prompt``.
-
-    Returns:
-        Decoded response strings, same order as ``prompts``.
-    """
-    tokenizer.padding_side = "left"
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    device = next(model.parameters()).device
-    responses: list[str] = []
-
-    for start in tqdm(range(0, len(prompts), batch_size), desc="  batches", leave=False, dynamic_ncols=True):
-        batch = [format_prompt(tokenizer, p, extra_cfg) for p in prompts[start : start + batch_size]]
-        inputs = tokenizer(
-            batch, return_tensors="pt", padding=True, truncation=True, max_length=1024
-        ).to(device)
-        prompt_len = inputs["input_ids"].shape[1]
-
-        with steerer.steer(layer_config):
-            out = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-
-        for output_ids in out:
-            responses.append(
-                tokenizer.decode(output_ids[prompt_len:], skip_special_tokens=True).strip()
-            )
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    return responses
-
-
-# ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
+
 
 def _savefig(fig: plt.Figure, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -269,7 +214,8 @@ def plot_results(
     """Generate condition comparison, by-source, and per-prompt heatmap plots.
 
     Args:
-        df:         DataFrame with columns ``condition``, ``judge_score``, ``source``, ``prompt_id``.
+        df:         DataFrame with columns ``condition``, ``judge_score``,
+                    ``source``, ``prompt_id``.
         behavior:   Behavior name (used in plot titles).
         model_name: Short model slug.
         scale:      K scale multiplier (used in plot titles).
@@ -277,8 +223,12 @@ def plot_results(
     """
     n_cond = len(CONDITIONS)
     agg = df.groupby("condition")["judge_score"].mean().reindex(CONDITIONS).fillna(0)
+
     fig, ax = plt.subplots(figsize=(max(6, n_cond * 1.4), 4))
-    bars = ax.bar(range(n_cond), agg.values, color=[CONDITION_COLORS[c] for c in CONDITIONS], width=0.5)
+    bars = ax.bar(
+        range(n_cond), agg.values,
+        color=[CONDITION_COLORS[c] for c in CONDITIONS], width=0.5,
+    )
     ax.bar_label(bars, fmt="%.3f", padding=3, fontsize=9)
     ax.set_xticks(range(n_cond))
     ax.set_xticklabels([CONDITION_LABELS[c] for c in CONDITIONS], fontsize=9)
@@ -289,7 +239,11 @@ def plot_results(
     _savefig(fig, fig_dir / "condition_comparison.pdf")
 
     sources = sorted(df["source"].unique())
-    src_palette = {"harmbench": "#7c3aed", "clearharm": "#059669", "anthropic_syco": "#ea580c"}
+    src_palette = {
+        "harmbench": "#7c3aed",
+        "clearharm": "#059669",
+        "anthropic_syco": "#ea580c",
+    }
     x = np.arange(n_cond)
     fig, ax = plt.subplots(figsize=(max(7, n_cond * 1.6), 4))
     for i, src in enumerate(sources):
@@ -314,7 +268,9 @@ def plot_results(
     _savefig(fig, fig_dir / "by_source.pdf")
 
     pivot = (
-        df.pivot_table(index="prompt_id", columns="condition", values="judge_score", aggfunc="mean")
+        df.pivot_table(
+            index="prompt_id", columns="condition", values="judge_score", aggfunc="mean"
+        )
         .reindex(columns=CONDITIONS)
         .fillna(0)
     )
@@ -330,10 +286,11 @@ def plot_results(
 
 
 # ---------------------------------------------------------------------------
-# Per-model runner
+# Checkpoint helpers
 # ---------------------------------------------------------------------------
 
-def _k_tag(scale) -> str:
+
+def _k_tag(scale: Any) -> str:
     return f"k{float(scale):.2f}".replace(".", "_")
 
 
@@ -343,7 +300,7 @@ def _results_complete(
     behavior: str,
     k_scales: list[float],
 ) -> bool:
-    """Return True if all outputs for this model × behavior already exist."""
+    """Return True if all scored outputs for this model × behavior already exist."""
     baseline_csv = output_root / model_name / behavior / "baseline" / "scored_results.csv"
     if not baseline_csv.exists():
         return False
@@ -351,6 +308,35 @@ def _results_complete(
         (output_root / model_name / behavior / _k_tag(s) / "scored_results.csv").exists()
         for s in k_scales
     )
+
+
+def _load_checkpoint(ckpt_path: Path, force: bool) -> pd.DataFrame:
+    if not force and ckpt_path.exists():
+        df = pd.read_csv(ckpt_path)
+        logger.info("  Resuming from checkpoint: %d records already saved", len(df))
+        return df
+    return pd.DataFrame()
+
+
+def _is_ckpt(
+    existing: pd.DataFrame,
+    behavior: str,
+    condition: str,
+    k_scale: float | None,
+) -> bool:
+    if existing.empty:
+        return False
+    mask = (existing["behavior"] == behavior) & (existing["condition"] == condition)
+    if k_scale is None:
+        mask &= existing["k_scale"].isna()
+    else:
+        mask &= existing["k_scale"].notna() & (existing["k_scale"].astype(float) == k_scale)
+    return bool(mask.any())
+
+
+# ---------------------------------------------------------------------------
+# Per-model generation — data-parallel fan-out
+# ---------------------------------------------------------------------------
 
 
 def run_model(
@@ -362,40 +348,37 @@ def run_model(
     output_root: Path,
     figures_root: Path,
     exp_cfg: ExperimentConfig,
-    registry: ModelRegistry,
+    n_gpus: int,
     batch_size: int,
+    load_in_4bit: bool = False,
     force: bool = False,
+    gpu_ids: list[int] | None = None,
 ) -> None:
-    """Run the full ramp steering eval for one model across all behaviors and K scales.
+    """Generate all responses for one model using N data-parallel GPU workers.
 
-    For each behavior:
-      - Skips entirely if all outputs exist and ``force`` is False.
-      - Runs baseline once (no steering hooks) and caches scores.
-      - Sweeps K scales with ramp_pos and ramp_neg; injects cached baseline rows
-        into each result DataFrame for unified plotting.
+    Builds a flat task list of ``(task_id, layer_config, prompts)`` for every
+    pending (behavior, condition, k_scale) triple, then fans all tasks out
+    across ``n_gpus`` workers simultaneously.  Saves a raw checkpoint CSV after
+    all tasks complete.  Does NOT run the judge.
 
     Args:
         model_cfg:      Config for the model to evaluate.
-        behaviors:      List of behavior names to evaluate.
-        k_scales:       K scale multipliers for the sweep.
-        eval_dir:       Directory containing behavior-specific JSONL eval prompt files.
+        behaviors:      Behavioral axes to evaluate.
+        k_scales:       K scale multipliers.
+        eval_dir:       Directory containing JSONL eval prompt files.
         directions_dir: Root directory for extracted direction npz files.
-        output_root:    Root directory for CSV outputs.
+        output_root:    Root directory for CSV checkpoints and scored outputs.
         figures_root:   Root directory for PDF plots.
-        exp_cfg:        Loaded ExperimentConfig.
-        registry:       ModelRegistry instance.
-        batch_size:     Batch size for generation.
-        force:          If True, overwrite existing results; otherwise skip.
+        exp_cfg:        Loaded ``ExperimentConfig``.
+        n_gpus:         Number of GPU workers to spawn.
+        batch_size:     Prompts per GPU forward pass.
+        load_in_4bit:   Use 4-bit NF4 quantisation on every worker.
+        force:          If True, ignore existing checkpoints and re-generate.
+        gpu_ids:        Explicit GPU indices; defaults to ``range(n_gpus)``.
     """
-    """Generate all responses for one model and checkpoint raw responses to disk.
+    logger.info("=== [GEN] %s  (n_gpus=%d, batch=%d) ===", model_cfg.name, n_gpus, batch_size)
 
-    Does NOT run the judge. Saves to ``output_root/{model}/raw_responses.csv``.
-    Resumes cleanly from an existing checkpoint — already-checkpointed or
-    already-scored rows are skipped without re-generation.
-    """
-    logger.info("=== [GEN] %s ===", model_cfg.name)
-
-    # Load directions for behaviors that still need work
+    # Load directions for behaviors that still have pending work
     behavior_directions: dict[str, list] = {}
     for behavior in behaviors:
         if not force and _results_complete(output_root, model_cfg.name, behavior, k_scales):
@@ -412,86 +395,106 @@ def run_model(
         return
 
     ckpt_path = output_root / model_cfg.name / "raw_responses.csv"
-    existing  = pd.read_csv(ckpt_path) if (not force and ckpt_path.exists()) else pd.DataFrame()
-    if not existing.empty:
-        logger.info("  Resuming from checkpoint: %d records already saved", len(existing))
+    existing = _load_checkpoint(ckpt_path, force)
 
-    def _is_ckpt(behavior: str, condition: str, k_scale) -> bool:
-        if existing.empty:
-            return False
-        mask = (existing["behavior"] == behavior) & (existing["condition"] == condition)
-        if k_scale is None:
-            mask &= existing["k_scale"].isna()
-        else:
-            mask &= existing["k_scale"].notna() & (existing["k_scale"].astype(float) == k_scale)
-        return mask.any()
+    # Build flat task list — one task per (behavior, condition, k_scale)
+    tasks: list[tuple[str, dict[int, tuple], list[str]]] = []
+    task_meta: dict[str, dict] = {}  # task_id → {behavior, condition, k_scale, eval_prompts}
 
+    for behavior, directions in behavior_directions.items():
+        eval_prompts = load_behavior_prompts(behavior, eval_dir)
+        prompts = [item["prompt"] for item in eval_prompts]
+
+        # Baseline
+        bl_dest = output_root / model_cfg.name / behavior / "baseline" / "scored_results.csv"
+        if force or (not bl_dest.exists() and not _is_ckpt(existing, behavior, "baseline", None)):
+            tid = f"{behavior}|baseline|None"
+            tasks.append((tid, {}, prompts))
+            task_meta[tid] = {
+                "behavior": behavior,
+                "condition": "baseline",
+                "k_scale": None,
+                "eval_prompts": eval_prompts,
+            }
+
+        # Steering conditions × k-scales
+        for scale in k_scales:
+            dest_done = (
+                output_root / model_cfg.name / behavior / _k_tag(scale) / "scored_results.csv"
+            ).exists()
+            for condition in STEER_CONDITIONS:
+                if not force and (
+                    dest_done or _is_ckpt(existing, behavior, condition, scale)
+                ):
+                    continue
+                layer_cfg = _CONDITION_CONFIGS[condition](directions, scale)
+                tid = f"{behavior}|{condition}|{scale}"
+                tasks.append((tid, layer_cfg, prompts))
+                task_meta[tid] = {
+                    "behavior": behavior,
+                    "condition": condition,
+                    "k_scale": scale,
+                    "eval_prompts": eval_prompts,
+                }
+
+    if not tasks:
+        logger.info("  %s — all tasks already checkpointed", model_cfg.name)
+        return
+
+    logger.info(
+        "  %s — %d tasks queued across %d GPUs", model_cfg.name, len(tasks), n_gpus,
+    )
+
+    # Fan all tasks out across n_gpus workers simultaneously
+    with DataParallelGenerator(
+        n_gpus=n_gpus,
+        model_cfg=model_cfg,
+        load_in_4bit=load_in_4bit,
+        gpu_ids=gpu_ids,
+    ) as gen:
+        all_responses = gen.generate_all(
+            tasks=tasks,
+            max_new_tokens=exp_cfg.max_new_tokens,
+            batch_size=batch_size,
+            extra_cfg=model_cfg.extra,
+        )
+
+    # Assemble new records
     new_records: list[dict] = []
-
-    with registry.loaded(model_cfg) as (model, tokenizer):
-        steerer = ActivationSteerer(model)
-
-        for behavior in tqdm(behavior_directions, desc=f"{model_cfg.name} behaviors", leave=False, dynamic_ncols=True):
-            eval_prompts = load_behavior_prompts(behavior, eval_dir)
-            prompts      = [item["prompt"] for item in eval_prompts]
-            directions   = behavior_directions[behavior]
-
-            # Baseline
-            bl_scored = output_root / model_cfg.name / behavior / "baseline" / "scored_results.csv"
-            if not force and (bl_scored.exists() or _is_ckpt(behavior, "baseline", None)):
-                logger.info("  %s | %s | baseline — skip", model_cfg.name, behavior)
-            else:
-                resps = generate_batched(
-                    model, tokenizer, steerer, {},
-                    prompts, exp_cfg.max_new_tokens, batch_size, model_cfg.extra,
-                )
-                for item, resp in zip(eval_prompts, resps):
-                    new_records.append({
-                        "model_name": model_cfg.name, "condition": "baseline",
-                        "behavior": behavior, "source": item["source"],
-                        "prompt_id": item["id"], "user_input": item["prompt"],
-                        "response": resp,
-                        "sycophantic_answer": item.get("sycophantic_answer", ""),
-                        "honest_answer":      item.get("honest_answer", ""),
-                        "k_scale": None,
-                    })
-
-            # K sweep
-            pending_scales = [
-                s for s in k_scales
-                if force
-                or not (output_root / model_cfg.name / behavior / _k_tag(s) / "scored_results.csv").exists()
-                and not all(_is_ckpt(behavior, c, s) for c in STEER_CONDITIONS)
-            ]
-
-            for scale in tqdm(pending_scales, desc=f"{behavior} k-sweep", leave=False, dynamic_ncols=True):
-                for condition in tqdm(STEER_CONDITIONS, desc=f"k={float(scale):.2f}", leave=False, dynamic_ncols=True):
-                    if not force and _is_ckpt(behavior, condition, scale):
-                        continue
-                    cfg   = _CONDITION_CONFIGS[condition](directions, scale)
-                    resps = generate_batched(
-                        model, tokenizer, steerer, cfg,
-                        prompts, exp_cfg.max_new_tokens, batch_size, model_cfg.extra,
-                    )
-                    for item, resp in zip(eval_prompts, resps):
-                        new_records.append({
-                            "model_name": model_cfg.name, "condition": condition,
-                            "behavior": behavior, "source": item["source"],
-                            "prompt_id": item["id"], "user_input": item["prompt"],
-                            "response": resp,
-                            "sycophantic_answer": item.get("sycophantic_answer", ""),
-                            "honest_answer":      item.get("honest_answer", ""),
-                            "k_scale": scale,
-                        })
+    for tid, responses in all_responses.items():
+        meta = task_meta[tid]
+        for item, resp in zip(meta["eval_prompts"], responses):
+            new_records.append({
+                "model_name": model_cfg.name,
+                "condition":  meta["condition"],
+                "behavior":   meta["behavior"],
+                "source":     item["source"],
+                "prompt_id":  item["id"],
+                "user_input": item["prompt"],
+                "response":   resp,
+                "sycophantic_answer": item.get("sycophantic_answer", ""),
+                "honest_answer":      item.get("honest_answer", ""),
+                "k_scale":    meta["k_scale"],
+            })
 
     if new_records:
-        combined = pd.concat([existing, pd.DataFrame(new_records)], ignore_index=True) \
-                   if not existing.empty else pd.DataFrame(new_records)
+        combined = (
+            pd.concat([existing, pd.DataFrame(new_records)], ignore_index=True)
+            if not existing.empty
+            else pd.DataFrame(new_records)
+        )
         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
         combined.to_csv(ckpt_path, index=False)
-        logger.info("  %s — checkpoint saved (%d total records)", model_cfg.name, len(combined))
+        logger.info(
+            "  %s — checkpoint saved (%d total records)", model_cfg.name, len(combined)
+        )
     else:
         logger.info("  %s — no new records", model_cfg.name)
+
+
+# ---------------------------------------------------------------------------
+# Judge pass
+# ---------------------------------------------------------------------------
 
 
 def score_and_save(
@@ -505,8 +508,17 @@ def score_and_save(
 ) -> None:
     """Score all raw responses for one model and write final CSVs + plots.
 
-    Loads ``raw_responses.csv``, runs SmallModelJudge in one pass, saves
-    scored CSVs per condition and per K-scale, then plots.
+    Loads the raw checkpoint, runs ``SmallModelJudge`` across all GPUs in one
+    pass, then saves per-condition/per-K-scale CSVs and figures.
+
+    Args:
+        model_name:   Short model slug.
+        behaviors:    Behavioral axes to score.
+        k_scales:     K scale multipliers.
+        output_root:  Root directory for scored CSV outputs.
+        figures_root: Root directory for PDF plots.
+        exp_cfg:      Loaded ``ExperimentConfig``.
+        force:        If True, re-score even if outputs already exist.
     """
     ckpt_path = output_root / model_name / "raw_responses.csv"
     if not ckpt_path.exists():
@@ -515,7 +527,6 @@ def score_and_save(
 
     raw = pd.read_csv(ckpt_path)
 
-    # Only score rows whose destination CSV doesn't exist yet
     to_score: list[dict] = []
     for _, row in raw.iterrows():
         behavior = row["behavior"]
@@ -545,18 +556,23 @@ def score_and_save(
         p = output_root / model_name / behavior / "baseline" / "scored_results.csv"
         return pd.read_csv(p) if p.exists() else pd.DataFrame()
 
-    for behavior in tqdm(behaviors, desc=f"{model_name} saving", leave=False, dynamic_ncols=True):
-        # Save baseline
+    for behavior in tqdm(
+        behaviors, desc=f"{model_name} saving", leave=False, dynamic_ncols=True
+    ):
         bl = scored[(scored["behavior"] == behavior) & (scored["condition"] == "baseline")]
         if not bl.empty:
             out = output_root / model_name / behavior / "baseline"
             out.mkdir(parents=True, exist_ok=True)
             bl.to_csv(out / "scored_results.csv", index=False)
-            logger.info("  %s | %s | baseline  mean=%.3f", model_name, behavior, bl["judge_score"].mean())
+            logger.info(
+                "  %s | %s | baseline  mean=%.3f",
+                model_name, behavior, bl["judge_score"].mean(),
+            )
 
-        # Save each K-scale
         baseline_df = _baseline_rows(behavior)
-        for scale in tqdm(k_scales, desc=f"{behavior} k-scales", leave=False, dynamic_ncols=True):
+        for scale in tqdm(
+            k_scales, desc=f"{behavior} k-scales", leave=False, dynamic_ncols=True
+        ):
             scale_rows = scored[
                 (scored["behavior"] == behavior)
                 & scored["k_scale"].notna()
@@ -564,8 +580,11 @@ def score_and_save(
             ]
             if scale_rows.empty:
                 continue
-            all_df  = pd.concat([scale_rows, baseline_df], ignore_index=True) \
-                      if not baseline_df.empty else scale_rows
+            all_df = (
+                pd.concat([scale_rows, baseline_df], ignore_index=True)
+                if not baseline_df.empty
+                else scale_rows
+            )
             out_dir = output_root / model_name / behavior / _k_tag(scale)
             fig_dir = figures_root / model_name / behavior / _k_tag(scale)
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -573,15 +592,18 @@ def score_and_save(
             summary = all_df.groupby("condition")["judge_score"].agg(["mean", "std", "count"])
             summary.columns = ["mean_score", "std_score", "n"]
             summary.to_csv(out_dir / "summary.csv")
-            logger.info("  %s | %s | k=%.2f\n%s", model_name, behavior, scale, summary.to_string())
+            logger.info(
+                "  %s | %s | k=%.2f\n%s", model_name, behavior, scale, summary.to_string()
+            )
             plot_results(all_df, behavior, model_name, scale, fig_dir)
 
     logger.info("=== [DONE] %s ===", model_name)
 
 
 # ---------------------------------------------------------------------------
-# Main
+# CLI
 # ---------------------------------------------------------------------------
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Experiment 03 — ramp steering eval")
@@ -591,68 +613,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-prompts",      default="data/eval_prompts")
     parser.add_argument("--output-dir",        default="results/ramp_eval")
     parser.add_argument("--figures-dir",       default="figures/ramp_eval")
-    parser.add_argument("--batch-size",   type=int,   default=64)
-    parser.add_argument("--models",     nargs="*", help="Explicit list; overrides --include-base.")
-    parser.add_argument("--behaviors",  nargs="*", help="Default: from experiment.yml.")
-    parser.add_argument("--k-scales",   nargs="*", type=float, help="Default: from experiment.yml.")
+    parser.add_argument("--batch-size",  type=int, default=64,
+                        help="Prompts per GPU batch (default 64; use 128+ on 40 GB A100).")
+    parser.add_argument("--n-gpus",      type=int, default=None,
+                        help="GPU workers per model (default: all available GPUs).")
+    parser.add_argument("--models",    nargs="*", help="Explicit list; overrides --include-base.")
+    parser.add_argument("--behaviors", nargs="*", help="Default: from experiment.yml.")
+    parser.add_argument("--k-scales",  nargs="*", type=float, help="Default: from experiment.yml.")
     parser.add_argument("--include-base", action="store_true",
                         help="Also evaluate base (non-instruct) models.")
     parser.add_argument("--force",        action="store_true",
                         help="Overwrite existing results instead of skipping.")
-    parser.add_argument("--load-in-4bit", action="store_true")
-    parser.add_argument("--gpus-per-model", type=int, default=1,
-                        help="Number of GPUs per model (default 1). Total GPUs used = models × gpus-per-model.")
+    parser.add_argument("--load-in-4bit", action="store_true",
+                        help="4-bit NF4 quantisation on all GPU workers (halves VRAM).")
     return parser.parse_args()
 
 
-def _generation_worker(
-    name: str,
-    gpu_ids: list[int],
-    args_dict: dict,
-    all_configs_dict: dict,
-    exp_cfg_dict: dict,
-) -> None:
-    """Subprocess worker: generate one model on assigned GPUs and checkpoint."""
-    import os as _os
-    # Restrict this process to its assigned GPUs
-    _os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
-
-    # Re-import inside subprocess (avoids CUDA fork issues)
-    import logging as _logging
-    _logging.basicConfig(
-        level=_logging.INFO,
-        format=f"%(asctime)s | GPU{gpu_ids} | %(levelname)s | %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
-    from activation_baking.config import ModelConfig, ExperimentConfig
-    from activation_baking.registry import ModelRegistry
-
-    model_cfg = ModelConfig(**all_configs_dict[name])
-    exp_cfg   = ExperimentConfig(**exp_cfg_dict)
-
-    device_map = "cuda:0" if len(gpu_ids) == 1 else "auto"
-    registry   = ModelRegistry(load_in_4bit=args_dict["load_in_4bit"], device_map=device_map)
-
-    run_model(
-        model_cfg=model_cfg,
-        behaviors=args_dict["behaviors"],
-        k_scales=[float(s) for s in args_dict["k_scales"]],
-        eval_dir=Path(args_dict["eval_prompts"]),
-        directions_dir=Path(args_dict["directions"]),
-        output_root=Path(args_dict["output_dir"]),
-        figures_root=Path(args_dict["figures_dir"]),
-        exp_cfg=exp_cfg,
-        registry=registry,
-        batch_size=args_dict["batch_size"],
-        force=args_dict["force"],
-    )
-
-
 def main() -> None:
-    import multiprocessing as mp
-    from dataclasses import asdict
-
     args        = parse_args()
     all_configs = load_model_configs(args.config)
     exp_cfg     = load_experiment_config(args.experiment_config)
@@ -671,52 +648,30 @@ def main() -> None:
     behaviors = args.behaviors or exp_cfg.behaviors
     k_scales  = [float(s) for s in (args.k_scales or exp_cfg.k_scales)]
 
+    n_gpus_available = torch.cuda.device_count()
+    n_gpus = args.n_gpus if args.n_gpus is not None else n_gpus_available
+    n_gpus = max(1, min(n_gpus, n_gpus_available))
+
     output_root  = Path(args.output_dir)
     figures_root = Path(args.figures_dir)
 
-    n_gpus        = torch.cuda.device_count()
-    gpus_per_model = args.gpus_per_model
-    n_parallel     = max(1, n_gpus // gpus_per_model)
-
+    # Total task count for upfront logging
+    n_tasks_per_model = (1 + len(STEER_CONDITIONS) * len(k_scales)) * len(behaviors)
     logger.info(
-        "%d models × %d behaviors × %d k-scales | batch=%d | GPUs=%d | parallel=%d | gpus_per_model=%d",
-        len(target_names), len(behaviors), len(k_scales),
-        args.batch_size, n_gpus, n_parallel, gpus_per_model,
+        "%d models × %d behaviors × %d k-scales × %d cond = %d tasks/model | "
+        "batch=%d | GPUs=%d/%d (workers per model)",
+        len(target_names), len(behaviors), len(k_scales), len(CONDITIONS),
+        n_tasks_per_model, args.batch_size, n_gpus, n_gpus_available,
     )
 
-    # Serialise configs for subprocess workers (dataclasses → dicts)
-    all_configs_dict = {n: asdict(c) for n, c in all_configs.items()}
-    exp_cfg_dict     = asdict(exp_cfg)
-    args_dict = {
-        "behaviors":    behaviors,
-        "k_scales":     k_scales,
-        "eval_prompts": args.eval_prompts,
-        "directions":   args.directions,
-        "output_dir":   args.output_dir,
-        "figures_dir":  args.figures_dir,
-        "batch_size":   args.batch_size,
-        "force":        args.force,
-        "load_in_4bit": args.load_in_4bit,
-    }
+    # ---------------------------------------------------------------------------
+    # Phase 1 — generation (data-parallel; one model at a time, N GPU workers)
+    # ---------------------------------------------------------------------------
+    logger.info("Phase 1: generation — %d GPU workers per model", n_gpus)
+    failed: list[str] = []
 
-    # -----------------------------------------------------------------------
-    # Phase 1 — generation
-    #
-    # Two modes depending on gpus_per_model:
-    #   gpus_per_model == n_gpus  →  sequential, all GPUs per model (max throughput
-    #                                per model, 1.6TB RAM keeps weights between runs)
-    #   gpus_per_model < n_gpus   →  parallel subprocesses, each pinned to a GPU slice
-    # -----------------------------------------------------------------------
-    failed = []
-
-    if gpus_per_model >= n_gpus:
-        # All GPUs to one model at a time — sequential, no subprocess overhead
-        logger.info(
-            "Phase 1: sequential mode — all %d GPUs per model, batch_size=%d",
-            n_gpus, args.batch_size,
-        )
-        registry = ModelRegistry(load_in_4bit=args.load_in_4bit, device_map="auto")
-        for name in tqdm(target_names, desc="Generation", unit="model", dynamic_ncols=True):
+    for name in tqdm(target_names, desc="Generation", unit="model", dynamic_ncols=True):
+        try:
             run_model(
                 model_cfg=all_configs[name],
                 behaviors=behaviors,
@@ -726,53 +681,26 @@ def main() -> None:
                 output_root=output_root,
                 figures_root=figures_root,
                 exp_cfg=exp_cfg,
-                registry=registry,
+                n_gpus=n_gpus,
                 batch_size=args.batch_size,
+                load_in_4bit=args.load_in_4bit,
                 force=args.force,
             )
+        except Exception as exc:
+            logger.error("Generation failed for %s: %s", name, exc, exc_info=True)
+            failed.append(name)
 
-    else:
-        # Parallel subprocesses — each model gets its own GPU slice
-        logger.info(
-            "Phase 1: parallel mode — %d models × %d GPUs each",
-            min(len(target_names), n_parallel), gpus_per_model,
-        )
-        mp.set_start_method("spawn", force=True)
+    if failed:
+        logger.error("Generation failed for: %s", failed)
 
-        gpu_assignments = [
-            list(range(i * gpus_per_model, min((i + 1) * gpus_per_model, n_gpus)))
-            for i in range(len(target_names))
-        ]
+    # ---------------------------------------------------------------------------
+    # Phase 2 — judge: Qwen32B loads across all GPUs once all generation is done
+    # ---------------------------------------------------------------------------
+    logger.info("Phase 2: all generation complete — starting judge pass (all %d GPUs)...", n_gpus_available)
 
-        processes = []
-        for i, name in enumerate(target_names):
-            gpu_ids = gpu_assignments[i] if i < len(gpu_assignments) else [i % n_gpus]
-            p = mp.Process(
-                target=_generation_worker,
-                args=(name, gpu_ids, args_dict, all_configs_dict, exp_cfg_dict),
-                name=f"gen-{name}",
-            )
-            p.start()
-            logger.info("  Started %s on GPU(s) %s (pid=%d)", name, gpu_ids, p.pid)
-            processes.append((name, p))
-
-        for name, p in processes:
-            p.join()
-            if p.exitcode != 0:
-                logger.error("  Worker for %s exited with code %d", name, p.exitcode)
-                failed.append(name)
-            else:
-                logger.info("  Worker for %s done.", name)
-
-        if failed:
-            logger.error("Generation failed for: %s", failed)
-
-    # -----------------------------------------------------------------------
-    # Phase 2 — judge all checkpoints; Qwen32B uses all GPUs via device_map=auto
-    # -----------------------------------------------------------------------
-    logger.info("Phase 2: all generation done, starting judge pass (all GPUs)...")
     for name in tqdm(target_names, desc="Judging", unit="model", dynamic_ncols=True):
         if name in failed:
+            logger.info("  Skipping %s (generation failed)", name)
             continue
         score_and_save(
             model_name=name,
