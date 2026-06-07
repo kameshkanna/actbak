@@ -51,12 +51,18 @@ class ModelConfig:
 
     @property
     def middle_layer_range(self) -> tuple[int, int]:
-        """Inclusive (start, end) indices of the middle 50% of layers."""
-        return self.num_layers // 4, (3 * self.num_layers) // 4
+        """Layer range used for K-value lookup and norm profiling: 40–90% depth.
+
+        Matches the extraction range in ``DirectionExtractor.middle_layers`` so
+        that ``load_k_values`` produces a non-zero K for every layer that is
+        both extracted and injected.  The previous 25–75% range caused a silent
+        mismatch where layers 75–90% were extracted and injected with K=0.
+        """
+        return int(self.num_layers * 0.40), int(self.num_layers * 0.90)
 
     @property
     def middle_layers(self) -> list[int]:
-        """Layer indices spanning the middle 50% of the network."""
+        """Layer indices from 40% to 90% depth — matching DirectionExtractor range."""
         start, end = self.middle_layer_range
         return list(range(start, end))
 
