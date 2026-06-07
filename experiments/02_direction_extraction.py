@@ -125,6 +125,8 @@ def parse_args() -> argparse.Namespace:
         "--device", default="cuda:0",
         help="Single GPU to use (default: cuda:0). Override via CUDA_VISIBLE_DEVICES.",
     )
+    parser.add_argument("--force", action="store_true",
+                        help="Overwrite existing direction files instead of skipping.")
     return parser.parse_args()
 
 
@@ -163,7 +165,7 @@ def main() -> None:
                 continue
 
             out_path = output_dir / name / f"{behavior}.npz"
-            if out_path.exists():
+            if out_path.exists() and not args.force:
                 logger.info("Skipping %s | %s (already exists at %s).", name, behavior, out_path)
                 continue
 
