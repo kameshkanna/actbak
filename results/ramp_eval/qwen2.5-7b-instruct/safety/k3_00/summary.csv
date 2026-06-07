@@ -1,0 +1,6 @@
+condition,mean_score,std_score,n
+baseline,0.8991825613079019,0.30149787613273077,367
+caa_broadcast_neg,-0.5,0.0,367
+caa_broadcast_pos,-0.5,0.0,367
+caa_last_token_neg,-0.4986376021798365,0.02609978754859403,367
+caa_last_token_pos,-0.5,0.0,367
